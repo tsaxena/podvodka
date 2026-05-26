@@ -1,0 +1,22 @@
+python behavior_cloning/run_clm.py \
+  --model_name_or_path Qwen/Qwen2.5-7B \
+  --train_file train_strings_2.txt \
+  --validation_file val_strings_2.txt \
+  --per_device_train_batch_size 2 \
+  --per_device_eval_batch_size 2 \
+  --gradient_accumulation_steps 2 \
+  --learning_rate 0.00002294 \
+  --preprocessing_num_workers 4 \
+  --do_train --do_eval \
+  --torch_dtype bfloat16 \
+  --gradient_checkpointing \
+  --logging_dir qwen2.5-7b-finetuned-log \
+  --output_dir qwen2.5-7b-finetuned \
+  --num_train_epochs 6 \
+  --logging_steps 5 \
+  --save_steps 50 \
+  --save_total_limit 2 \
+  --evaluation_strategy steps \
+  --eval_steps 100 \
+  --report_to wandb \
+  --weight_decay 0.00002092

@@ -411,7 +411,8 @@ def load_model(model_args, config):
 
 def add_special_tokens_and_resize(tokenizer, model):
     """Add [PAD] and </s> tokens and resize model embeddings to match."""
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     tokenizer.add_special_tokens({'sep_token': '</s>'})
     sep_token_id = tokenizer('</s>')['input_ids'][0]
     model.resize_token_embeddings(len(tokenizer))
