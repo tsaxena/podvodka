@@ -1,8 +1,8 @@
 program: run_clm.py
 method: bayes
-run_cap: 25
+run_cap: 20
 metric:
-  name: eval/loss
+  name: eval_loss
   goal: minimize
 
 parameters:
@@ -10,13 +10,13 @@ parameters:
   model_name_or_path:
     value: gpt2-large
   output_dir:
-    value: gpt2-sweep  
+    value: gpt2-sweep
   train_file:
     value: train_strings.txt
   validation_file:
     value: val_strings.txt
-  # Optimization — continued pretraining wants lower LR than from-scratch
-  # but higher than fine-tuning, to actually move the weights meaningfully
+
+  # Optimization
   learning_rate:
     distribution: log_uniform_values
     min: 5e-6
@@ -38,12 +38,14 @@ parameters:
   max_grad_norm:
     value: 1.0
 
-  # Batch — push effective batch size higher for stable LM training
-  # effective = per_device * grad_accum * num_gpus; target 128-512
+  # Batch — tuned for 1723 training blocks
+  # effective batch = per_device * grad_accum; targeting 32-64 for ~80-160 steps over 3 epochs
   per_device_train_batch_size:
     values: [4, 8]
+  per_device_eval_batch_size:
+    value: 4
   gradient_accumulation_steps:
-    values: [16, 32, 64]
+    values: [2, 4, 8]
 
   # Data
   block_size:
@@ -51,31 +53,25 @@ parameters:
   preprocessing_num_workers:
     value: 8
 
-  # Training duration — continued pretraining is measured in tokens/steps, not epochs
-  max_steps:
-    value: 20000
+  # Training duration
   num_train_epochs:
-    value: -1  # ignored when max_steps is set
+    value: 3
 
-  # Eval & checkpointing
+  # Eval & checkpointing — scaled to expected ~80-160 optimizer steps per run
   eval_strategy:
     value: steps
   eval_steps:
-    value: 500
+    value: 20
   save_strategy:
     value: steps
   save_steps:
-    value: 1000
+    value: 40
   save_total_limit:
-    value: 3
+    value: 2
   logging_steps:
-    value: 50
+    value: 5
 
-  # Precision & memory
-  fp16:
-    value: true
-  gradient_checkpointing:
-    value: true
+  # Optimizer
   optim:
     value: adamw_torch_fused
 
@@ -85,11 +81,18 @@ parameters:
 
 early_terminate:
   type: hyperband
-  min_iter: 2000
+  min_iter: 20
   eta: 3
 
+# Boolean flags passed explicitly to avoid HF argparse misinterpreting --flag=true
 command:
   - ${env}
   - python
   - ${program}
-  - ${args}
+  - ${args_no_boolean_flags}
+  - --do_train
+  - --do_eval
+  - --fp16
+  - --gradient_checkpointing
+  - --overwrite_output_dir
+  - --report_to=wandb
