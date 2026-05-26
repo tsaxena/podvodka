@@ -1,5 +1,22 @@
 # Step 1: Supervised Fine-Tuning
 
+## Environment Setup
+
+Install system dependencies:
+```bash
+sudo apt update && sudo apt install -y \
+    pkg-config \
+    libcairo2-dev \
+    libgirepository1.0-dev \
+    gcc \
+    python3-dev
+```
+
+Install Python dependencies:
+```bash
+pip install -r requirements.txt
+```
+
 We fine-tune a `gpt2-large` in the following setting:
 
 1. We constuct a dataset containig strings `image description</s>prompt<|endoftext|>`
@@ -7,9 +24,14 @@ We fine-tune a `gpt2-large` in the following setting:
 
 You can find the modified version of the fine-tuning script in the `run_clm.py` file.
 
-For hyperparameter search we use W&B Sweep to find the best values of `learing_rate` and `weight_decay`. The Sweep's config is written in the `sweep.yml` file.
+For hyperparameter search we use W&B Sweep to find the best values of `learning_rate` and `weight_decay`. The sweep config is written in the `sweep.yml` file.
 
-Finally, to reproduce the training with the best params, run
+To run the sweep:
+```bash
+sh run_sweep.sh
+```
+
+To reproduce the training with the best params, run:
 ```bash
 sh run_training.sh
 ```
@@ -31,3 +53,8 @@ This uses the same `run_clm.py` script with the following key differences:
 - Output dir: `qwen2.5-7b-finetuned`
 - Logs dir: `qwen2.5-7b-finetuned-log`
 - Training logged to W&B (`--report_to wandb`)
+
+To run a hyperparameter sweep for Qwen (config in `sweep_qwen.yml`):
+```bash
+sh run_sweep_qwen.sh
+```

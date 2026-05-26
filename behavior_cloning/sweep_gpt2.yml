@@ -1,0 +1,95 @@
+program: run_clm.py
+method: bayes
+run_cap: 25
+metric:
+  name: eval/loss
+  goal: minimize
+
+parameters:
+  # Model
+  model_name_or_path:
+    value: gpt2-large
+  output_dir:
+    value: gpt2-sweep  
+  train_file:
+    value: train_strings.txt
+  validation_file:
+    value: val_strings.txt
+  # Optimization — continued pretraining wants lower LR than from-scratch
+  # but higher than fine-tuning, to actually move the weights meaningfully
+  learning_rate:
+    distribution: log_uniform_values
+    min: 5e-6
+    max: 5e-5
+  weight_decay:
+    value: 0.01
+  warmup_ratio:
+    distribution: uniform
+    min: 0.01
+    max: 0.05
+  lr_scheduler_type:
+    values: [cosine, linear]
+  adam_beta1:
+    value: 0.9
+  adam_beta2:
+    values: [0.95, 0.98]
+  adam_epsilon:
+    value: 1e-8
+  max_grad_norm:
+    value: 1.0
+
+  # Batch — push effective batch size higher for stable LM training
+  # effective = per_device * grad_accum * num_gpus; target 128-512
+  per_device_train_batch_size:
+    values: [4, 8]
+  gradient_accumulation_steps:
+    values: [16, 32, 64]
+
+  # Data
+  block_size:
+    value: 1024
+  preprocessing_num_workers:
+    value: 8
+
+  # Training duration — continued pretraining is measured in tokens/steps, not epochs
+  max_steps:
+    value: 20000
+  num_train_epochs:
+    value: -1  # ignored when max_steps is set
+
+  # Eval & checkpointing
+  eval_strategy:
+    value: steps
+  eval_steps:
+    value: 500
+  save_strategy:
+    value: steps
+  save_steps:
+    value: 1000
+  save_total_limit:
+    value: 3
+  logging_steps:
+    value: 50
+
+  # Precision & memory
+  fp16:
+    value: true
+  gradient_checkpointing:
+    value: true
+  optim:
+    value: adamw_torch_fused
+
+  # Reproducibility
+  seed:
+    values: [42, 1337]
+
+early_terminate:
+  type: hyperband
+  min_iter: 2000
+  eta: 3
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args}
