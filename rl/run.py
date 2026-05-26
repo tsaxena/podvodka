@@ -3,66 +3,12 @@ import os
 from typing import List
 
 import torch
-from transformers import pipeline
+from transformers import AutoTokenizer, pipeline
 import pandas as pd
+from tqdm import tqdm
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
-import trlx
-from trlx.data.default_configs import (
-    ModelConfig,
-    OptimizerConfig,
-    PPOConfig,
-    SchedulerConfig,
-    TokenizerConfig,
-    TrainConfig,
-    TRLConfig,
-)
-import torch
-from trlx.data.default_configs import TRLConfig
-
-
-def get_config(args):
-    return TRLConfig(
-        train=TrainConfig(
-            seq_length=1024,
-            epochs=100,
-            total_steps=10000,
-            batch_size=32,
-            checkpoint_interval=10000,
-            eval_interval=100,
-            pipeline="PromptPipeline",
-            trainer="AcceleratePPOTrainer",
-        ),
-        model=ModelConfig(model_path=args.base_model_path, num_layers_unfrozen=args.num_layers_unfrozen),
-        tokenizer=TokenizerConfig(tokenizer_path=args.base_model_path, truncation_side="right"),
-        optimizer=OptimizerConfig(
-            name="adamw", kwargs=dict(lr=args.lr, betas=(0.9, 0.95), eps=1.0e-8, weight_decay=1.0e-6)
-        ),
-        scheduler=SchedulerConfig(name="cosine_annealing", kwargs=dict(T_max=10000, eta_min=args.lr)),
-        method=PPOConfig(
-            name="PPOConfig",
-            num_rollouts=args.num_rollouts,
-            chunk_size=args.chunk_size,
-            ppo_epochs=4,
-            init_kl_coef=args.init_kl_coef,
-            target=6,
-            horizon=10000,
-            gamma=1,
-            lam=0.95,
-            cliprange=0.2,
-            cliprange_value=0.2,
-            vf_coef=args.vf_coef,
-            scale_reward="ignored",
-            ref_mean=None,
-            ref_std=None,
-            cliprange_reward=10,
-            gen_kwargs=dict(
-                max_new_tokens=80,
-                top_k=0,
-                top_p=1.0,
-                do_sample=True,
-            ),
-        ),
-    )
+from trl import PPOConfig, PPOTrainer, AutoModelForCausalLMWithValueHead
 
 
 def main():
@@ -80,37 +26,106 @@ def main():
     parser.add_argument("--base_model_path", type=str, default="toloka/gpt2-large-supervised-prompt-writing")
     args = parser.parse_args()
 
-    config = TRLConfig.update(get_config(args).to_dict(), {})
-
     if torch.cuda.is_available():
         device = int(os.environ.get("LOCAL_RANK", 0))
     else:
         device = -1
 
-    reward_model = pipeline('text-classification', model=args.reward_model_path, device=device)
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, truncation_side="right")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(args.base_model_path)
+    ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(args.base_model_path)
+
+    # Freeze all layers except the last num_layers_unfrozen transformer blocks and value head
+    for param in model.pretrained_model.parameters():
+        param.requires_grad = False
+    for block in list(model.pretrained_model.transformer.h)[-args.num_layers_unfrozen:]:
+        for param in block.parameters():
+            param.requires_grad = True
+    for param in model.v_head.parameters():
+        param.requires_grad = True
+
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr,
+        betas=(0.9, 0.95),
+        eps=1.0e-8,
+        weight_decay=1.0e-6,
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=10000, eta_min=args.lr)
+
+    ppo_config = PPOConfig(
+        model_name=args.base_model_path,
+        learning_rate=args.lr,
+        batch_size=args.num_rollouts,
+        mini_batch_size=args.chunk_size,
+        gradient_accumulation_steps=1,
+        ppo_epochs=4,
+        init_kl_coef=args.init_kl_coef,
+        target=6,
+        horizon=10000,
+        gamma=1,
+        lam=0.95,
+        cliprange=0.2,
+        cliprange_value=0.2,
+        vf_coef=args.vf_coef,
+        cliprange_reward=10,
+    )
+
+    reward_pipeline = pipeline("text-classification", model=args.reward_model_path, device=device)
 
     @torch.no_grad()
     def score(text):
-        return reward_model(text, function_to_apply='none')[0]['score']
-
-    def reward_fn(prompts: List[str], outputs: List[str], **kwargs) -> List[float]:
-        sentiments = [score(x + '</s>' + y) for x, y in zip(prompts, outputs)]
-        return sentiments
+        return reward_pipeline(text, function_to_apply="none")[0]["score"]
 
     train_df = pd.read_csv(args.train_path)
-    prompts = [l.split('</s>')[0] + '</s>' for l in train_df['text']]
+    prompts = [l.split("</s>")[0] + "</s>" for l in train_df["text"]]
 
     val_df = pd.read_csv(args.val_path)
-    eval_prompts = [l.split('</s>')[0] + '</s>' for l in val_df['text']][:100]
+    eval_prompts = [l.split("</s>")[0] + "</s>" for l in val_df["text"]][:100]
 
-    trainer = trlx.train(
-        reward_fn=reward_fn,
-        prompts=prompts,
-        eval_prompts=eval_prompts * 2,
-        config=config,
+    ppo_trainer = PPOTrainer(
+        config=ppo_config,
+        model=model,
+        ref_model=ref_model,
+        tokenizer=tokenizer,
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
     )
 
-    trainer.save_pretrained(args.output_path)
+    gen_kwargs = dict(
+        max_new_tokens=80,
+        top_k=0,
+        top_p=1.0,
+        do_sample=True,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+
+    for step in tqdm(range(10000)):
+        indices = torch.randint(0, len(prompts), (args.num_rollouts,))
+        batch_prompts = [prompts[i] for i in indices]
+
+        query_tensors = [
+            tokenizer(p, return_tensors="pt", truncation=True, max_length=1024).input_ids.squeeze(0)
+            for p in batch_prompts
+        ]
+
+        full_sequences = ppo_trainer.generate(query_tensors, **gen_kwargs)
+        response_tensors = [r[len(q):] for q, r in zip(query_tensors, full_sequences)]
+
+        batch_responses = [tokenizer.decode(r, skip_special_tokens=False) for r in response_tensors]
+
+        rewards = [
+            torch.tensor(score(p + "</s>" + r), dtype=torch.float)
+            for p, r in zip(batch_prompts, batch_responses)
+        ]
+
+        stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
+        ppo_trainer.log_stats(stats, {"query": batch_prompts, "response": batch_responses}, rewards)
+
+    ppo_trainer.save_pretrained(args.output_path)
 
 
 if __name__ == "__main__":

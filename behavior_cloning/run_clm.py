@@ -22,7 +22,7 @@ https://huggingface.co/models?filter=text-generation
 
 import wandb
 
-wandb.init(project="gpt-2-self-supervised-prompt-writing", entity='trsaxena')
+#wandb.init(project="gpt-2-self-supervised-prompt-writing", entity='trsaxena')
 
 import logging
 import math
@@ -612,6 +612,8 @@ def build_trainer(model, training_args, train_dataset, eval_dataset, tokenizer,
 
 def run_training(trainer, training_args, last_checkpoint, train_dataset, data_args):
     """Run trainer.train(), save the model, and log train metrics."""
+    print(f"Model device: {next(trainer.model.parameters()).device}")
+    print(f"Trainer args device: {training_args.device}")
     checkpoint = training_args.resume_from_checkpoint or last_checkpoint
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
     trainer.save_model()
