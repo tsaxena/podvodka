@@ -15,3 +15,19 @@ sh run_training.sh
 ```
 
 We used a single NVIDIA A100 80 GB GPU, the full training takes roughly 90 mins.
+
+## Fine-tuning Qwen2.5-7B
+
+To fine-tune `Qwen/Qwen2.5-7B` instead of `gpt2-large`, run
+
+```bash
+sh run_training_qwen.sh
+```
+
+This uses the same `run_clm.py` script with the following key differences:
+- Model: `Qwen/Qwen2.5-7B`
+- dtype: `bfloat16`
+- Gradient checkpointing enabled
+- Output dir: `qwen2.5-7b-finetuned`
+- Logs dir: `qwen2.5-7b-finetuned-log`
+- Training logged to W&B (`--report_to wandb`)
