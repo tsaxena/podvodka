@@ -4,7 +4,7 @@ This folder contains the reward model training scripts.
 
 Download the results from Toloka, build a Docker image (don't forget to put your HuggingFace token into `dockerfile`), and run `run.py`.
 
-This script trains a `distilroberta-base` on a pairwise ranking loss. Additionaly, auxillary loss of comparisons with obviously wrong prompts is used.
+This script trains a `distilroberta-base` using TRL's `RewardTrainer` with the Bradley-Terry pairwise ranking loss. Auxiliary comparisons with obviously wrong prompts are merged into the training dataset.
 
 The final model: https://huggingface.co/toloka/prompts_reward_model
 
