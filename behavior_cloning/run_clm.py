@@ -47,6 +47,7 @@ from transformers import (
     HfArgumentParser,
     Trainer,
     TrainingArguments,
+    TrainerCallback,  
     default_data_collator,
     DataCollatorForLanguageModeling,
     #is_torch_tpu_available,
@@ -257,7 +258,7 @@ def setup_logging(training_args):
 def detect_last_checkpoint(training_args):
     """Return path to the last checkpoint if resuming, or None if starting fresh."""
     last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and training_args.do_train: #and not training_args.overwrite_output_dir:
+    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
             raise ValueError(
@@ -607,6 +608,7 @@ def build_trainer(model, training_args, train_dataset, eval_dataset, tokenizer,
         data_collator=collate_fn,
         compute_metrics=compute_metrics if training_args.do_eval else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics if training_args.do_eval else None,
+        callbacks=[WandbBestEvalCallback()]
     )
 
 
@@ -661,6 +663,32 @@ def push_or_create_model_card(trainer, model_args, data_args, training_args):
         trainer.push_to_hub(**kwargs)
     else:
         trainer.create_model_card(**kwargs)
+
+
+class WandbBestEvalCallback(TrainerCallback):
+    """After each eval, update wandb run summary with the best eval_loss so far.
+    
+    This ensures hyperband-terminated runs still have a summary value,
+    so sweep parallel coords and scatter plots can show them.
+    """
+    def __init__(self):
+        self.best_eval_loss = float("inf")
+    
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics is None:
+            return
+        eval_loss = metrics.get("eval_loss")
+        if eval_loss is None:
+            return
+        if eval_loss < self.best_eval_loss:
+            self.best_eval_loss = eval_loss
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.run.summary["best_eval_loss"] = eval_loss
+                    wandb.run.summary["eval_loss"] = eval_loss  # overwrite so panels work
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
