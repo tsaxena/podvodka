@@ -58,64 +58,69 @@ def reward_fn(prompt: str, response: str) -> float:
 
 
 # ============================================================
-# TEST PAIRS — REPLACE WITH YOUR DOMAIN
+# TEST PAIRS — T2I PROMPT AUTOCOMPLETE DOMAIN
 # ============================================================
-# Each entry: (label, prompt, response). Label is "good" or "bad" so we can
-# verify the RM separates them. Aim for 10–20 of each.
+# Each entry: (label, prompt, response).
+# prompt  = partial text-to-image prompt the user has typed so far
+# response = autocomplete suggestion to append / complete it with
+# Label is "good" or "bad" so we can verify the RM separates them.
+# Aim for 10–20 of each.
 
 pairs = [
-    # --- GOOD responses ---
-    ("good", "What is the capital of France?",
-     "The capital of France is Paris."),
-    ("good", "Explain photosynthesis in one sentence.",
-     "Photosynthesis is the process by which plants use sunlight, water, "
-     "and carbon dioxide to produce glucose and oxygen."),
-    ("good", "Write a polite refusal to a meeting invite.",
-     "Thanks for the invite — unfortunately I have a conflict at that time. "
-     "Could we look at Thursday afternoon instead?"),
-    ("good", "Give one tip for better sleep.",
-     "Keep a consistent sleep schedule, even on weekends — going to bed and "
-     "waking up at the same time helps regulate your circadian rhythm."),
-    ("good", "What does HTTP stand for?",
-     "HTTP stands for HyperText Transfer Protocol. It's the protocol used "
-     "for transmitting web pages over the internet."),
-    ("good", "Translate 'good morning' to Spanish.",
-     "'Good morning' in Spanish is 'buenos días'."),
-    ("good", "Recommend a beginner Python book.",
-     "'Python Crash Course' by Eric Matthes is a solid pick for beginners — "
-     "it covers fundamentals with hands-on projects."),
-    ("good", "How do I boil an egg?",
-     "Place eggs in a saucepan, cover with cold water by an inch, bring to "
-     "a boil, then turn off heat and cover for 9–12 minutes depending on "
-     "how firm you want the yolk."),
-    ("good", "What's 17 times 23?",
-     "17 × 23 = 391."),
-    ("good", "Define machine learning briefly.",
-     "Machine learning is a branch of AI where systems learn patterns from "
-     "data to make predictions or decisions without being explicitly "
-     "programmed for each case."),
+    # --- GOOD autocomplete suggestions ---
+    ("good", "a portrait of a young woman",
+     "soft natural lighting, shallow depth of field, bokeh background, "
+     "film grain, 85mm lens, golden hour"),
+    ("good", "cyberpunk cityscape at night",
+     "neon lights reflecting on wet pavement, towering skyscrapers, "
+     "holographic advertisements, dense fog, cinematic, 8k"),
+    ("good", "a cozy cabin in the woods",
+     "during autumn, warm light glowing through the windows, fallen leaves, "
+     "smoke rising from the chimney, hyperrealistic, golden hour"),
+    ("good", "an astronaut floating in space",
+     "tattered suit, distant Earth in background, dramatic rim lighting, "
+     "photorealistic, ultra-detailed, cinematic composition"),
+    ("good", "oil painting of a medieval knight",
+     "full plate armor, holding a longsword, dramatic chiaroscuro lighting, "
+     "impressionist brushwork, warm color palette, museum quality"),
+    ("good", "a fantasy landscape with floating islands",
+     "waterfalls cascading into the clouds below, lush vegetation, ancient "
+     "ruins, volumetric lighting, matte painting style, epic scale"),
+    ("good", "close-up of a hummingbird",
+     "feeding from a red flower, wings mid-beat, vivid iridescent feathers, "
+     "macro photography, shallow DOF, natural backlight"),
+    ("good", "a futuristic laboratory interior",
+     "holographic displays, sleek white surfaces, scientists working, "
+     "blue ambient lighting, wide-angle lens, sci-fi concept art"),
+    ("good", "sketch of a dragon",
+     "pencil on paper, intricate scale detail, spread wings, fierce "
+     "expression, cross-hatching shading, fantasy illustration style"),
+    ("good", "street food market in Tokyo",
+     "at dusk, lanterns hanging above stalls, steam rising from grills, "
+     "crowd of people, warm tungsten light, street photography style"),
 
-    # --- BAD responses ---
-    ("bad", "What is the capital of France?",
-     "asdf asdf asdf banana"),
-    ("bad", "Explain photosynthesis in one sentence.",
-     "I don't know and I don't care, stop asking me stuff."),
-    ("bad", "Write a polite refusal to a meeting invite.",
-     "NO. Go away."),
-    ("bad", "Give one tip for better sleep.",
-     "Just don't sleep lol"),
-    ("bad", "What does HTTP stand for?",
-     "Hyper Tomato Transfer Pizza"),
-    ("bad", "Translate 'good morning' to Spanish.",
-     "yes."),
-    ("bad", "Recommend a beginner Python book.",
-     "books are stupid read a wiki idk"),
-    ("bad", "How do I boil an egg?",
-     "throw it at the wall and hope"),
-    ("bad", "What's 17 times 23?",
-     "probably like a thousand or something"),
-    ("bad", "Define machine learning briefly.",
-     "it's when computers do the thinking thing with the data stuff"),
+    # --- BAD autocomplete suggestions ---
+    ("bad", "a portrait of a young woman",
+     "person thing face yes pretty nice good"),
+    ("bad", "cyberpunk cityscape at night",
+     "it is dark outside and there are buildings and stuff happening"),
+    ("bad", "a cozy cabin in the woods",
+     ""),
+    ("bad", "an astronaut floating in space",
+     "astronaut space float weightless"),
+    ("bad", "oil painting of a medieval knight",
+     "I don't know what style you want, please be more specific about "
+     "what kind of knight painting you are looking for in your image"),
+    ("bad", "a fantasy landscape with floating islands",
+     "island float sky cloud green blue purple orange yellow red"),
+    ("bad", "close-up of a hummingbird",
+     "bird flower photo taken outside in the daytime somewhere nice"),
+    ("bad", "a futuristic laboratory interior",
+     "lab room science white clean future"),
+    ("bad", "sketch of a dragon",
+     "draw a dragon for me thanks very much"),
+    ("bad", "street food market in Tokyo",
+     "food japan market people eating yummy delicious street"),
 ]
 
 
