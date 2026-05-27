@@ -1,0 +1,24 @@
+python run_clm.py \
+  --model_name_or_path gpt2-large \
+  --train_file train_strings.txt \
+  --validation_file val_strings.txt \
+  --output_dir gpt2-large-final \
+  --do_train --do_eval \
+  --fp16 --gradient_checkpointing --overwrite_output_dir \
+  --report_to wandb \
+  --num_train_epochs 8 \
+  --eval_strategy steps --eval_steps 20 \
+  --save_strategy steps --save_steps 20 \
+  --save_total_limit 3 \
+  --load_best_model_at_end True \
+  --metric_for_best_model eval_loss \
+  --greater_is_better False \
+  --logging_steps 5 \
+  --optim adamw_torch_fused \
+  --learning_rate 4.5e-5 \
+  --warmup_ratio 0.03 \
+  --lr_scheduler_type linear \
+  --per_device_train_batch_size 8 \
+  --gradient_accumulation_steps 2 \
+  --adam_beta2 0.98 \
+  --seed 42
