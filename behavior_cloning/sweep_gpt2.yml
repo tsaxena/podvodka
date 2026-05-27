@@ -2,15 +2,13 @@ program: run_clm.py
 method: bayes
 run_cap: 20
 metric:
-  name: eval_loss
+  name: best_eval_loss
   goal: minimize
 
 parameters:
   # Model
   model_name_or_path:
     value: gpt2-large
-  output_dir:
-    value: gpt2-sweep
   train_file:
     value: train_strings.txt
   validation_file:
@@ -62,12 +60,6 @@ parameters:
     value: steps
   eval_steps:
     value: 20
-  save_strategy:
-    value: steps
-  save_steps:
-    value: 40
-  save_total_limit:
-    value: 2
   logging_steps:
     value: 5
 
@@ -90,9 +82,11 @@ command:
   - python
   - ${program}
   - ${args_no_boolean_flags}
+  - --output_dir=gpt2-sweep
   - --do_train
   - --do_eval
   - --fp16
   - --gradient_checkpointing
   - --overwrite_output_dir
   - --report_to=wandb
+  - --save_strategy=no
