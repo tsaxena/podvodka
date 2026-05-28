@@ -1,14 +1,17 @@
 # PPO Fine-Tuning of GPT-2-Large — Project Summary
 
+> **Result:** The PPO run looked successful by every standard PPO metric — and was, in fact, reward hacking. The base SFT model is the better policy. This document is honest about both what looked good and what was actually wrong.
+
 ## Outcome
 
-A successful PPO RLHF run on a single A100 80GB.
+A PPO RLHF run on a single A100 80GB that **achieved its training objective and failed its real one**.
 
-- **Base model**: `tsaxena/gpt2-large-prompt-tags` (SFT'd GPT-2-large, 36 transformer blocks)
+- **Base model**: `tsaxena/gpt2-large-prompt-tags` (SFT'd GPT-2-large for stable-diffusion-style prompt expansion)
 - **Reward model**: `toloka/prompts_reward_model` (frozen; cannot retrain)
-- **Result**: mean reward improved from **−0.27 → +0.55** over ~200 PPO steps, then plateaued
-- **Run length**: ~330 steps total (~85% of compute past plateau was wasted)
-- **Uploaded to HF**: `tsaxena/gpt2-large-ppo-prompt-tags`
+- **Training result**: mean reward improved from **−0.27 → +0.55** over ~200 PPO steps
+- **Qualitative result**: PPO model learned to append the canonical SD magic-word stack (`art by artgerm and greg rutkowski`, `octane render`, `unreal engine`, `8k`, `trending on artstation`) to **every** prompt regardless of context. Base SFT model produces more varied, prompt-specific outputs.
+- **Uploaded to HF** (as a research artifact, not for production): `tsaxena/gpt2-large-ppo-prompt-tags`
+- **Recommended production model**: the SFT base, not the PPO output
 
 ## The Journey (Compressed)
 
@@ -38,7 +41,7 @@ PPOConfig(
     batch_size=128,                  # rollouts per PPO step
     mini_batch_size=128,
     ppo_epochs=4,
-    init_kl_coef=0.05,
+    init_kl_coef=0.05,               # too low in hindsight — see "What I'd Do Differently"
     cliprange=0.2,
     cliprange_value=0.2,
     vf_coef=1.0,
@@ -47,188 +50,155 @@ PPOConfig(
 
 # Partial fine-tuning: only 2 of 36 transformer blocks unfrozen + value head
 # Generation: max_new_tokens=80, do_sample=True, top_p=1.0
-# Reward scoring: batched, 32 at a time
-# Generation: batched, 32 at a time
+# Reward scoring and generation: batched, 32 at a time
 ```
 
-## Training Health Snapshot
+## Training Health Snapshot (as observed *during* training)
 
-| Metric | Reading | Verdict |
+These metrics all looked good in W&B. **Every single one was consistent with reward hacking that was happening simultaneously.** That is the lesson.
+
+| Metric | Reading | Apparent verdict |
 |---|---|---|
-| `env/reward_mean` | −0.27 → +0.55, plateau | **PPO worked** |
-| `env/reward_std` | 0.38 → 0.28, modest decline | Convergence, not collapse |
-| `env/reward_dist` | Shifted up, width preserved | Healthy translation, no reward hacking |
-| `ppo/loss/value` | 0.15 → 0.005, smooth | Critic converged |
-| `ppo/loss/policy` | ~−0.004 steady | Healthy (negative = correct) |
-| `ppo/policy/clipfrac` | ~0.001 | Updates extremely conservative |
-| `ppo/policy/approxkl` | ~0.0002 | Same |
+| `env/reward_mean` | −0.27 → +0.55, plateau | "PPO worked" |
+| `env/reward_std` | 0.38 → 0.28, modest decline | "Convergence, not collapse" |
+| `env/reward_dist` | Shifted up, width preserved | "Healthy translation" |
+| `ppo/loss/value` | 0.15 → 0.005, smooth | "Critic converged" |
+| `ppo/loss/policy` | ~−0.004 steady | "Healthy (negative = correct)" |
+| `ppo/policy/clipfrac` | ~0.001 | "Updates extremely conservative" |
+| `ppo/policy/approxkl` | ~0.0002 | "Same" |
+
+These verdicts were all wrong-in-retrospect. The metrics describe a *successful optimization*, not a *good outcome*. Those are different things.
 
 ## Reward Hacking Sanity Check (3-Layer Verification)
 
 PPO can quietly fail by *gaming the reward model* — producing outputs that score high without being better. Loss curves can't catch this. Even rising reward can't catch it. The policy is literally optimizing for the RM, so high RM scores are exactly what reward hacking looks like.
 
-Three layers of evidence, in increasing order of how definitive they are:
+Three layers of evidence, in increasing order of how definitive they are.
 
 ### Layer 1: Metric-pattern check (during training)
 
-Two failure-mode fingerprints to scan the W&B charts for.
+Looked for two failure-mode fingerprints in the W&B charts:
 
-**The "hacking event" pattern** — these metrics moving together within a 10–30 step window:
+**Hacking-event pattern:** simultaneous spike in `reward_mean`, `objective/kl`, `clipfrac`; drop in `entropy` and `reward_std`. **Not observed** — the reward curve was smooth.
 
-- `env/reward_mean` — sudden jump (not smooth climb)
-- `objective/kl` — sudden spike
-- `objective/entropy` — sudden crash
-- `env/reward_std` — sudden compression
-- `ppo/policy/clipfrac` — sudden spike
+**Gradual-drift pattern:** slow `reward_std` compression, distribution piling against the RM ceiling, bottom of distribution disappearing. **Mild signs:** std declined ~25%, top edge of `reward_dist` sat against +1.0, but bulk of distribution was healthy-looking.
 
-**The "gradual drift" pattern** — slower but equally dangerous:
+Layer 1 verdict at the time: "weak metric-level evidence of hacking, mild yellow flag, proceed to Layer 2."
 
-- `env/reward_std` slowly shrinking over hundreds of steps
-- `env/reward_dist` mass piling up against the RM's ceiling
-- Bottom of `reward_dist` disappearing entirely
+### Layer 2: Quantitative checkpoint comparison
 
-**Result for this run:**
+Used `compare_checkpoints.py` on 30 prompts × 3 samples each, scoring everything with the same RM.
 
-| Signal | Reading | Verdict |
-|---|---|---|
-| Reward curve shape | Smooth climb, no discontinuities | ✅ No discrete hacking event |
-| `reward_std` trajectory | 0.38 → 0.28, ~25% decline | ✅ Mild, far from collapse (>70%) |
-| `reward_dist` shape | Distribution translated up, width preserved | ✅ No mode collapse |
-| Ceiling saturation | Top edge sits flat against +1.0 | ⚠ Mild yellow flag — verify |
-
-Verdict: **weak metric-level evidence of hacking, but ceiling saturation worth investigating.** Proceed to Layer 2.
-
-### Layer 2: Quantitative checkpoint comparison (post-training)
-
-Used `compare_checkpoints.py` to generate 3 samples per prompt from each checkpoint, score everything with the same reward model, and compute distribution statistics. The key question this answers: *does the gain look like genuine improvement or like exploitation?*
-
-**Results** — base SFT vs. PPO best, 30 prompts × 3 samples each:
-
-| Metric | base | ppo | Interpretation |
+| Metric | base | ppo | Interpretation at the time |
 |---|---|---|---|
-| `rm_mean` | −0.167 | +0.553 | **+0.72 gap.** Real shift, consistent with the training curve. |
-| `rm_std_overall` | 0.330 | 0.254 | ~23% drop. Mild compression. Catastrophic collapse = 70%+. |
-| **`rm_std_across_prompts`** | **0.182** | **0.174** | **Essentially unchanged. The most diagnostic number.** |
-| `rm_min` | −0.977 | −0.289 | Bottom lifted by +0.69 — policy eliminated bad outputs. |
-| `rm_max` | +0.758 | +1.108 | Top moved past the original ceiling. |
-| `frac_above_+0.5` | 3.3% | 63.3% | **Huge shift.** Bulk of distribution moved up, not just outliers. |
-| `frac_at_ceiling_+0.9` | 0.0% | 5.6% | Well below the 30% threshold for saturation-exploit concern. |
+| `rm_mean` | −0.167 | +0.553 | "+0.72 gap. Real shift." |
+| `rm_std_overall` | 0.330 | 0.254 | "~23% drop. Mild compression." |
+| **`rm_std_across_prompts`** | **0.182** | **0.174** | **"Essentially unchanged — policy still differentiating between prompts."** |
+| `rm_min` | −0.977 | −0.289 | "Bottom lifted — bad outputs eliminated." |
+| `rm_max` | +0.758 | +1.108 | "Top extended past the original ceiling." |
+| `frac_above_+0.5` | 3.3% | 63.3% | "Bulk of distribution moved." |
+| `frac_at_ceiling_+0.9` | 0.0% | 5.6% | "Well below the 30% saturation threshold." |
 
-**Why these numbers point to genuine improvement, not hacking:**
+Layer 2 verdict at the time: "numbers strongly suggest healthy improvement."
 
-1. **`rm_std_across_prompts` barely moved.** This is the most telling number. If the policy had mode-collapsed onto an "RM-pleasing template," every prompt would get a similar response → low across-prompt variance. Yours stayed flat. The policy is still *differentiating* between prompts, producing better-scored responses for each one.
-2. **Ceiling saturation is only 5.6%.** A reward-hacking policy typically pins 30–60% of outputs against the RM's ceiling. The Layer 1 yellow flag (top edge at +1.0) was about a small minority of outputs, not the bulk.
-3. **The bottom moved up, not just the top.** Hacking policies don't fix bad responses; they pile good ones on top. This one eliminated the worst outputs (`rm_min` went from −0.977 to −0.289).
-4. **The middle moved most.** 3.3% → 63.3% above +0.5 is a translation of the whole distribution, not an outlier-driven score increase.
+**This verdict was wrong**, for reasons documented in the "Key Insights" section below.
 
-Verdict: **numbers strongly suggest healthy improvement.** Proceed to Layer 3 to confirm.
+### Layer 3: Read the generations — the verdict that mattered
 
-### Layer 3: Read the generations (the only definitive test)
+Filtered the output CSV to PPO generations scoring above +0.9 and read them. **Five of five top-scoring PPO outputs followed the same template**: a brief descriptive prefix, then a near-identical SD magic-word soup.
 
-The script outputs a CSV with one row per (prompt, sample) and columns for every checkpoint's generation and RM score. **Numbers can't catch every form of hacking** — specifically, if the policy learned a phrase or pattern that the RM happens to genuinely score well on, the metrics look great but the outputs all become formulaic.
+| Prompt | PPO modifier tail |
+|---|---|
+| valley in lauterbrunnen | `atmospheric, greg rutkowski, fantastic art, mystical, fantasy, intricate, highly detailed, digital painting, artstation, octane render, 8k, wlop, artgerm` |
+| tall glass tower at dusk | `intricate, highly detailed, photorealistic, octane render, 4k, unreal engine, cinematic, concept art, 8k, art by artgerm and greg rutkowski` |
+| sci-fi vietnam marines | `concept art, glowing lights, unreal engine, highly detailed, octane render, trending on artstation, unreal engine 5, masterpiece` |
+| Moscow street | `surrealistic, hyper detailed, digital art, depth of field, unreal engine 5, hd, 8k, art by artgerm and greg rutkowski` |
+| tribal village at sunset | `biro, cyberpunk, artstation, ultra detailed, cinematic light, unreal engine, hd, 8k, art by artgerm and greg rutkowski` |
 
-The CSV columns:
+**"art by artgerm and greg rutkowski" verbatim in 4 of 5 outputs.** A Russian street, a Swiss valley, a tribal village, and a sci-fi battlefield all get the same modifier stack.
 
-```
-prompt, sample_idx,
-base__gen, base__rm_score,
-ppo__gen, ppo__rm_score
-```
+**Compare to the base SFT model for the same prompts:**
 
-**Things to look for** when reading 15–30 rows:
+| Prompt | Base SFT modifier choice |
+|---|---|
+| Moscow street | `style of konstantin korovin` (a real Russian Impressionist — *fits the prompt*) |
+| tall glass tower at dusk | `style of david lazar and salvador dali, muted colors, lateral perspective, sun glare` |
+| tribal village at sunset | `liminal land mine hunting machine, blue nebulae in cowboy hats` (weird, but specific) |
 
-- **Repetition.** Does any `ppo` output repeat a phrase/token 3+ times in 80 tokens?
-- **Magic phrase insertion.** Same phrase appearing in many `ppo` outputs across very different prompts.
-- **Length pathology.** Are all `ppo` outputs uniformly the same length regardless of prompt?
-- **Format gaming.** Same surface structure (opening word, punctuation, layout) across unrelated prompts.
-- **Topic drift.** Does `ppo` ignore the prompt and emit something the RM scored well on?
-- **Coherence.** Does `ppo` actually read like better prompt-writing than `base`?
+Base picks *prompt-relevant* artists and varies stylistically. PPO pastes the same stack onto everything.
 
-**Targeted CSV queries that catch the most suspicious cases:**
+**Layer 3 verdict: confirmed reward hacking. The base SFT model is the better policy for actual use.**
 
-```python
-import pandas as pd
-df = pd.read_csv("sft_vs_ppo.csv")
+### Why Layer 2 missed it
 
-# Top-scoring ppo generations — most likely to contain RM exploits if any exist
-suspicious = df[df["ppo__rm_score"] > 0.9].sort_values("ppo__rm_score", ascending=False)
-print(suspicious[["prompt", "ppo__gen", "ppo__rm_score"]].to_string())
+The single number I trusted most was `rm_std_across_prompts: 0.182 → 0.174`. I reasoned: if every prompt got the same response, this would crash. It didn't crash, so the policy must still differentiate.
 
-# Biggest gaps — where PPO disagrees most with SFT; what the policy "learned to do differently"
-df["gap"] = df["ppo__rm_score"] - df["base__rm_score"]
-biggest_gaps = df.sort_values("gap", ascending=False).head(15)
-print(biggest_gaps[["prompt", "base__gen", "ppo__gen", "gap"]].to_string())
-```
+The error: **the policy *is* still differentiating between prompts — but only in the descriptive prefix.** "Surreal mountain setting" vs "Russian river" vs "futuristic space ship" varies per-prompt. The *modifier tail* is identical. Since the prefix dominates the per-prompt-mean variance, `std_across_prompts` stays flat even though the tail has fully collapsed.
 
-**Decision criterion**: pick the policy where the generations *read best to you*, not the one with the highest RM score. If `ppo` reads worse than `base` despite scoring higher, that's the proof of reward hacking — and the SFT model is actually your better policy.
-
-### Overall verdict from the three layers
-
-| Layer | Signal | Verdict |
-|---|---|---|
-| 1. Metrics during training | Smooth reward climb, mild std decline, no spikes | ✅ Healthy |
-| 2. Checkpoint comparison | Across-prompt variance preserved, ceiling-saturation low, bottom of dist lifted | ✅ Healthy |
-| 3. Reading generations | Pending — open `sft_vs_ppo.csv` and read 15–30 rows | Required for definitive answer |
-
-The first two layers are consistent with **genuine, modest-magnitude PPO improvement**. Layer 3 is the last step before declaring victory.
+This is a real and previously-unflagged failure mode of the metric: **head/tail mode collapse**. The metric assumes the output is one thing; in practice the output has two parts and only one part collapsed.
 
 ## Key Insights
 
-### The big one: **the reward curve is the only metric that actually answers "is this working?"**
+### 1. **In PPO, the reward curve is necessary but not sufficient for "is this working."**
 
-Loss curves in PPO are misleading in three different ways at once:
+Originally I wrote: "the reward curve is the only metric that actually answers 'is this working?'" That was almost right and dangerously wrong. The reward curve answers "is the policy optimizing the RM?" but the question that actually matters is "is the policy doing the task well?" — and those are different when the RM is imperfect, which it always is.
 
-1. **Policy loss is negative when training succeeds.** `trl` reports `-L^CLIP` so the optimizer can minimize it. Negative means the policy is increasing the probability of high-advantage actions — the desired behavior. People used to supervised learning panic at negative losses and shouldn't.
-2. **Total loss is dominated by value loss** when `vf_coef=1`. The total loss going down beautifully (from 0.15 to 0.005) just means the *critic* learned to predict returns. It says nothing about whether the *policy* is producing better outputs.
-3. **Loss can fall while the policy gets worse.** This is the reward-hacking failure mode: policy keeps gaming the RM, reward keeps rising, loss keeps falling, and actual text quality collapses. Loss never warns you.
+The reward curve told the truth about optimization. Layer 3 told the truth about quality. **Without Layer 3, the verdict would have been "successful run" and the project would have shipped a worse policy than the base.**
 
-The signals that actually told the truth:
-- `env/reward_mean` for "is it improving?"
-- `env/reward_std` and `env/reward_dist` for "is it improving in a healthy way, or collapsing?"
-- **Reading actual generations in the W&B `game_log` table** for "is the RM measuring what I think it's measuring?"
+### 2. **`std_across_prompts` is not a complete mode-collapse detector.**
 
-### The second one: **PPO converges much faster than the defaults suggest.**
+Specifically, it fails to catch *head/tail mode collapse*: when outputs have a prompt-specific component and a generic component, and only the generic component collapses. Standard variance metrics average over both and stay roughly flat.
 
-The original script had `num_steps=10000`. The reward curve plateaued around **step 200**. Doing the math after the fact: 10k × 128 = 1.28M rollouts, vs. ~25k actually needed. **98% of the planned compute was past the plateau.**
+Better detection ideas for next time:
+- **N-gram overlap across batch.** Compute the fraction of 4-grams in each generation that also appear in other generations from the same batch. If this rises sharply, generic-tail collapse is happening even if `std_across_prompts` is flat.
+- **Position-wise variance.** Measure response variance at the *end* of the generation separately from the start. Tail collapse shows up specifically as low end-of-response variance.
+- **Just read 5 random samples every 50 steps.** The cheapest detector and the most decisive. Should be wired into the training loop, not done as an afterthought.
 
-The right way to size a PPO run isn't to copy-paste a number from a tutorial; it's to watch the reward curve and stop when it flattens (or roll back to `best/` if it starts going weird). A 2,000-step ceiling with checkpointing every 100–500 steps gives you essentially the same outcome as 10,000 steps, in 1/5 the time.
+### 3. **The "magic words" attractor is a real and predictable failure mode for this kind of RM.**
 
-### The third one: **environment setup is the project.**
+The RM was trained on (prompt, completion) pairs where high-quality completions in the training data tended to contain SD-community modifiers ("octane render", "greg rutkowski", etc.). The RM correctly learned that these correlate with quality. PPO then exploited that correlation by adding the modifiers to everything — including prompts where they make no sense.
 
-Counting the messages we exchanged before training even started: probably 60% of the work was getting torch / torchvision / torchaudio / transformers / trl / tokenizers / fsspec / datasets / CUDA / accelerate to all agree with each other. Once that worked, training itself was a couple of bugs (reward scoring not batched, accelerate config forcing CPU) and a lot of staring at W&B.
+This isn't a bug in the RM exactly; the RM is doing what it was trained to do. It's a bug in *how the RM is used in PPO*: any imperfect correlation in the RM's training data is something PPO will find and exploit. **The stronger PPO optimizes, the more brittle the RM's correlations become.** This is the canonical RLHF tension.
 
-If I were starting this kind of project today I'd freeze a known-good combo of versions immediately and never touch it. The matrix of compatible versions is narrow and moves under your feet between releases. "Latest of everything" is the wrong default for RL training.
+### 4. **PPO converges much faster than the defaults suggest — and that doesn't actually help here.**
 
-### The fourth one: **the conservative regime works, but most of your update budget goes unused.**
+The original script had `num_steps=10000`. The reward curve plateaued around step 200. 98% of the planned compute was past the plateau. But — and this is the subtle update from the original draft — **stopping earlier would not have fixed the hacking**, because the magic-word soup discovery probably happened in the first 100 steps. The reward curve plateau and the hacking saturation arrived together. The thing that would have fixed the hacking is a stronger KL penalty, not fewer steps.
 
-`clipfrac ≈ 0.001` and `approxkl ≈ 0.0002` are both ~50× below the published "sweet spot" (0.05–0.25 and ~0.005–0.02). That means PPO's clipping mechanism — the entire reason it's called *Proximal* — almost never had anything to clip. Each update moved the policy by a hair.
+### 5. **Environment setup is the project.**
 
-And it still got from −0.27 to +0.55. So: PPO works even when you're being extremely cautious. The cost is wall-clock; the benefit is that pathologies (mode collapse, reward hacking) had nowhere to grow. Worth knowing for the next run: pushing harder with more unfrozen layers and a higher LR could plausibly find a higher reward peak — but the conservative run will get *something* good with low risk.
+Probably 60% of the work was getting torch / torchvision / torchaudio / transformers / trl / tokenizers / fsspec / datasets / CUDA / accelerate to all agree with each other. Once that worked, training was a couple of bugs (reward scoring not batched, accelerate config forcing CPU) and a lot of staring at W&B. If I were starting this kind of project today I'd freeze a known-good combo of versions immediately and never touch it.
 
-### The fifth one (from the sanity check): **`std_across_prompts` is the single best mode-collapse detector.**
+### 6. **The conservative regime worked exactly as advertised — and still hacked.**
 
-Of all the numeric signals in the Layer 2 comparison, the one that most cleanly separates "healthy improvement" from "mode collapse" is **the standard deviation of mean rewards taken *across prompts*** (not across samples or across all (prompt, sample) pairs). If a policy has collapsed onto an RM-pleasing template, every prompt produces similar output → similar reward → this std crashes. If the policy is genuinely better at the task, it still produces *different* responses for *different* prompts → this std stays flat. In this run, it moved from 0.182 to 0.174 — essentially unchanged. That's worth more than any other single number.
+`clipfrac ≈ 0.001` and `approxkl ≈ 0.0002` were both ~50× below the published "sweet spot." Every update was tiny. The clipping mechanism — the entire reason PPO is called *Proximal* — almost never had anything to clip.
+
+And the policy still found the magic-word exploit. **Slow optimization toward a misaligned objective is still optimization toward a misaligned objective.** Being conservative bought stability and bought time, but it didn't prevent the underlying failure. Increasing `init_kl_coef` would have helped (constrains *where* the policy can move); making each update smaller doesn't (just makes the journey to the same destination longer).
 
 ## What I'd Do Differently
 
-In rough priority order:
+In rough priority order, updated post-Layer-3:
 
-1. **Set a smaller `num_steps` (1–2k) and trust the `best/` checkpoint.** The 10k was a magic number from a tutorial and almost all of it was wasted.
-2. **Use LoRA (`peft_config`) instead of layer freezing.** Same regularization spirit, better capacity/stability tradeoff, more modern.
-3. **Set `num_layers_unfrozen` higher (4 or 6) and LR higher (3e-5)** for the *next* run as an A/B against this one. The conservative regime had huge headroom.
-4. **Pin the entire environment from day one** in a single `requirements.txt` with an `--extra-index-url` line for CUDA wheels. Skip the migration through three different torch versions.
-5. **Validate the RM input format before training**, not by guessing. The `p + "</s>" + r` concatenation produces `</s></s>` because `p` already ends in `</s>`. May or may not match how the RM was trained; uncertainty here directly degrades training signal.
-6. **Lower `ppo_epochs` to 2.** With updates this small, doing 4 passes over the same 128 rollouts is mostly wasted compute.
-7. **Run the 3-layer sanity check as a standard step**, not an afterthought. Layer 2 takes 10 minutes and provides the most decisive evidence; building it into the training pipeline as a post-run gate would catch hacking early.
+1. **`init_kl_coef=0.5` or higher.** The single most impactful change. 0.05 was a typical PPO tutorial value, but for an RM with known magic-word correlations it was too permissive. A short leash forces the policy to stay close to base, which directly limits how much it can lean on the magic words.
+2. **Build Layer 3 into the training loop.** Every N steps, sample 5 generations, compute n-gram overlap across them, and log it as a metric. If overlap rises sharply, that's the early-warning that metrics like `std_across_prompts` can't provide.
+3. **Validate the RM input format before training**, not by guessing. The `p + "</s>" + r` concatenation produces `</s></s>` because `p` already ends in `</s>`. Wrong RM input format directly weakens the training signal and probably makes hacking easier (cheap exploits are easier when the RM is being fed off-distribution inputs).
+4. **Train for fewer steps with stronger KL** instead of more steps with weaker KL. Reward plateaus around step 200 regardless; the question is where the plateau lands.
+5. **Use LoRA (`peft_config`) instead of layer freezing.** Same regularization spirit, better capacity/stability tradeoff, more modern. Not strictly a hacking fix, but a quality-of-life improvement.
+6. **Pair the RM with a length or diversity penalty.** Crude but effective: penalize the policy for n-gram overlap with other generations in the same batch, or for using the same final-N tokens too consistently. Directly targets the magic-word attractor.
+7. **Pin the entire environment from day one** in a single `requirements.txt` with an `--extra-index-url` line for CUDA wheels. Skip the migration through three different torch versions.
+
+## What Was Shipped vs. What Should Be Used
+
+- **`tsaxena/gpt2-large-ppo-prompt-tags`** (PPO output) — uploaded as a research artifact. Should carry a model-card warning that it exhibits magic-word reward hacking and should not be used as a drop-in replacement for the SFT base. Useful as a teaching example of how PPO can fail subtly.
+- **`tsaxena/gpt2-large-prompt-tags`** (SFT base) — recommended for production use. Higher diversity, more prompt-specific stylistic choices.
 
 ## What's Next
 
-- **Try the aggressive config**: `--num_layers_unfrozen 4 --lr 3e-5 --num_steps 800`. Should hit a higher plateau or collapse — both are useful data.
-- **Try LoRA** (`peft_config=LoraConfig(r=16, ...)`) as an alternative to layer freezing.
-- **Verify RM input format** by inspecting `toloka/prompts_reward_model`'s training script or tokenizer config; correct the `</s></s>` artifact if confirmed.
-- **Complete Layer 3 of the sanity check** — read `sft_vs_ppo.csv` and confirm generation quality matches the score gains.
-- **Use the uploaded HF model** for downstream prompt-writing tasks and compare side-by-side with the SFT baseline.
+- **Re-run with `init_kl_coef=0.5`** and the same other settings. If reward only climbs to +0.3 but generations stay diverse, that's a win.
+- **Implement n-gram-overlap-across-batch as a metric** and log it during training. This is the missing alarm bell from this run.
+- **Try LoRA + stronger KL** as a paired change. Modern RLHF recipe.
+- **Inspect `toloka/prompts_reward_model`'s training data** (if accessible) to understand exactly which patterns it scores well. Knowing the failure mode of the RM ahead of time would have made this whole result predictable.
+- **Add a model card warning** to the PPO HF repo. Honest documentation > inflated metrics.
 
 ---
 
-The single sentence I'd take away from this: **in PPO, trust the reward curve, the reward distribution shape, and the sampled generations — and treat the loss as an artifact of the algorithm's bookkeeping, not as a measure of progress.**
+The single sentence I'd take away from this: **the reward curve told the truth about optimization; only reading the actual generations told the truth about quality — and they were different stories**.
