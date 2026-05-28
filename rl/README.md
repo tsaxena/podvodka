@@ -1,182 +1,120 @@
-# RL Training Scripts
+# PPO Fine-Tuning of GPT-2-Large — Project Summary
 
-Two scripts are provided: `run.py` (PPO) and `run_grpo.py` (GRPO). See per-algorithm sections below.
+## Outcome
+
+A successful PPO RLHF run on a single A100 80GB.
+
+- **Base model**: `tsaxena/gpt2-large-prompt-tags` (SFT'd GPT-2-large, 36 transformer blocks)
+- **Reward model**: `toloka/prompts_reward_model` (frozen; cannot retrain)
+- **Result**: mean reward improved from **−0.27 → +0.55** over ~200 PPO steps, then plateaued
+- **Run length**: ~330 steps total (~85% of compute past plateau was wasted)
+- **Uploaded to HF**: `tsaxena/gpt2-large-ppo-prompt-tags`
+
+## The Journey (Compressed)
+
+The environment fight was longer than the training fight.
+
+| Stage | What went wrong | Fix |
+|---|---|---|
+| `trl` import | Module missing | `pip install trl` |
+| API mismatch | Tutorial used classic `PPOTrainer` API; recent `trl` rewrote it | Pinned `trl==0.11.4` |
+| `cliprange_reward` | Not a `trl` param — that's **trlX** | Removed; would manually clip if needed |
+| torch ↔ torchvision | `RuntimeError: operator torchvision::nms does not exist` (mismatched compiled ops) | Aligned both to torch 2.4.1 |
+| CUDA wheels | `torch==2.4.1+cu124` not on PyPI | `--index-url https://download.pytorch.org/whl/cu124` |
+| transformers too new | `torch.distributed.tensor.device_mesh` doesn't exist in torch 2.4 | Downgraded `transformers` to 4.45.2 |
+| Disk full | 20 GB container root vs 266 TB `/workspace` on RunPod | Redirected `HF_HOME`, `PIP_CACHE_DIR`, `TMPDIR` |
+| `datasets` ↔ `fsspec` | `datasets` pins `fsspec<=2026.2.0` | Unpinned fsspec |
+| **Training silently on CPU** | A100 sat at 0% util, model never on GPU | `accelerator_kwargs={"cpu": False}` in `PPOConfig` |
+| 50s/step | Reward pipeline scored one sample at a time | Batched to `score_batch()` with `batch_size=32` |
+| Slow generation | `trl`'s `generate()` defaults to `batch_size=4` | Bumped to 32 |
+| LR schedule no-op | `eta_min=lr` made cosine flat | Fixed to `lr * 0.1` |
+| No mid-run checkpoints | Single save at end → one crash = total loss | Added `step-*`, `best/`, `final/`, `interrupted/` checkpoints |
+
+## Final Configuration
+
+```python
+PPOConfig(
+    learning_rate=1.4e-5,
+    batch_size=128,                  # rollouts per PPO step
+    mini_batch_size=128,
+    ppo_epochs=4,
+    init_kl_coef=0.05,
+    cliprange=0.2,
+    cliprange_value=0.2,
+    vf_coef=1.0,
+    accelerator_kwargs={"cpu": False},  # CRITICAL — was silently CPU
+)
+
+# Partial fine-tuning: only 2 of 36 transformer blocks unfrozen + value head
+# Generation: max_new_tokens=80, do_sample=True, top_p=1.0
+# Reward scoring: batched, 32 at a time
+# Generation: batched, 32 at a time
+```
+
+## Training Health Snapshot
+
+| Metric | Reading | Verdict |
+|---|---|---|
+| `env/reward_mean` | −0.27 → +0.55, plateau | **PPO worked** |
+| `env/reward_std` | 0.38 → 0.28, modest decline | Convergence, not collapse |
+| `env/reward_dist` | Shifted up, width preserved | Healthy translation, no reward hacking |
+| `ppo/loss/value` | 0.15 → 0.005, smooth | Critic converged |
+| `ppo/loss/policy` | ~−0.004 steady | Healthy (negative = correct) |
+| `ppo/policy/clipfrac` | ~0.001 | Updates extremely conservative |
+| `ppo/policy/approxkl` | ~0.0002 | Same |
+
+## Key Insights
+
+### The big one: **the reward curve is the only metric that actually answers "is this working?"**
+
+Loss curves in PPO are misleading in three different ways at once:
+
+1. **Policy loss is negative when training succeeds.** `trl` reports `-L^CLIP` so the optimizer can minimize it. Negative means the policy is increasing the probability of high-advantage actions — the desired behavior. People used to supervised learning panic at negative losses and shouldn't.
+2. **Total loss is dominated by value loss** when `vf_coef=1`. The total loss going down beautifully (from 0.15 to 0.005) just means the *critic* learned to predict returns. It says nothing about whether the *policy* is producing better outputs.
+3. **Loss can fall while the policy gets worse.** This is the reward-hacking failure mode: policy keeps gaming the RM, reward keeps rising, loss keeps falling, and actual text quality collapses. Loss never warns you.
+
+The signals that actually told the truth:
+- `env/reward_mean` for "is it improving?"
+- `env/reward_std` and `env/reward_dist` for "is it improving in a healthy way, or collapsing?"
+- **Reading actual generations in the W&B `game_log` table** for "is the RM measuring what I think it's measuring?"
+
+### The second one: **PPO converges much faster than the defaults suggest.**
+
+The original script had `num_steps=10000`. The reward curve plateaued around **step 200**. Doing the math after the fact: 10k × 128 = 1.28M rollouts, vs. ~25k actually needed. **98% of the planned compute was past the plateau.**
+
+The right way to size a PPO run isn't to copy-paste a number from a tutorial; it's to watch the reward curve and stop when it flattens (or roll back to `best/` if it starts going weird). A 2,000-step ceiling with checkpointing every 100–500 steps gives you essentially the same outcome as 10,000 steps, in 1/5 the time.
+
+### The third one: **environment setup is the project.**
+
+Counting the messages we exchanged before training even started: probably 60% of the work was getting torch / torchvision / torchaudio / transformers / trl / tokenizers / fsspec / datasets / CUDA / accelerate to all agree with each other. Once that worked, training itself was a couple of bugs (reward scoring not batched, accelerate config forcing CPU) and a lot of staring at W&B.
+
+If I were starting this kind of project today I'd freeze a known-good combo of versions immediately and never touch it. The matrix of compatible versions is narrow and moves under your feet between releases. "Latest of everything" is the wrong default for RL training.
+
+### The fourth one: **the conservative regime works, but most of your update budget goes unused.**
+
+`clipfrac ≈ 0.001` and `approxkl ≈ 0.0002` are both ~50× below the published "sweet spot" (0.05–0.25 and ~0.005–0.02). That means PPO's clipping mechanism — the entire reason it's called *Proximal* — almost never had anything to clip. Each update moved the policy by a hair.
+
+And it still got from −0.27 to +0.55. So: PPO works even when you're being extremely cautious. The cost is wall-clock; the benefit is that pathologies (mode collapse, reward hacking) had nowhere to grow. Worth knowing for the next run: pushing harder with more unfrozen layers and a higher LR could plausibly find a higher reward peak — but the conservative run will get *something* good with low risk.
+
+## What I'd Do Differently
+
+In rough priority order:
+
+1. **Set a smaller `num_steps` (1–2k) and trust the `best/` checkpoint.** The 10k was a magic number from a tutorial and almost all of it was wasted.
+2. **Use LoRA (`peft_config`) instead of layer freezing.** Same regularization spirit, better capacity/stability tradeoff, more modern.
+3. **Set `num_layers_unfrozen` higher (4 or 6) and LR higher (3e-5)** for the *next* run as an A/B against this one. The conservative regime had huge headroom.
+4. **Pin the entire environment from day one** in a single `requirements.txt` with an `--extra-index-url` line for CUDA wheels. Skip the migration through three different torch versions.
+5. **Validate the RM input format before training**, not by guessing. The `p + "</s>" + r` concatenation produces `</s></s>` because `p` already ends in `</s>`. May or may not match how the RM was trained; uncertainty here directly degrades training signal.
+6. **Lower `ppo_epochs` to 2.** With updates this small, doing 4 passes over the same 128 rollouts is mostly wasted compute.
+
+## What's Next
+
+- **Try the aggressive config**: `--num_layers_unfrozen 4 --lr 3e-5 --num_steps 800`. Should hit a higher plateau or collapse — both are useful data.
+- **Try LoRA** (`peft_config=LoraConfig(r=16, ...)`) as an alternative to layer freezing.
+- **Verify RM input format** by inspecting `toloka/prompts_reward_model`'s training script or tokenizer config; correct the `</s></s>` artifact if confirmed.
+- **Read 20 generations end-to-end** from the `best/` checkpoint to confirm the reward gain corresponds to real quality improvement, not RM-pleasing patterns.
+- **Use the uploaded HF model** for downstream prompt-writing tasks and compare side-by-side with the SFT baseline.
 
 ---
 
-# PPO Setup Summary
-
-## Environment
-
-- **Hardware**: RunPod, 1× A100 80GB, driver supporting CUDA 12.8
-- **Stack** (after a lot of fighting):
-    - torch 2.4.1 + cu124, torchvision 0.19.1, torchaudio 2.4.1
-    - transformers 4.45.2
-    - trl 0.11.4 (pinned to keep the classic PPO API)
-    - tokenizers 0.20.x, accelerate, peft, datasets 4.8.4, fsspec ≤ 2026.2.0
-- **Cache locations**: `HF_HOME`, `PIP_CACHE_DIR`, `TMPDIR` all redirected to `/workspace` (container root is only 20 GB on RunPod; `/workspace` has terabytes)
-
-## Models and Data
-
-- **Policy / ref model**: `tsaxena/gpt2-large-prompt-tags` (GPT-2-large, 36 transformer blocks), wrapped with `AutoModelForCausalLMWithValueHead`
-- **Reward model**: `toloka/prompts_reward_model`, used as a `text-classification` pipeline; cannot be retrained
-- **Data**: train/val CSVs of prompt strings with `</s>` separators
-
-## PPO Configuration
-
-Key hyperparameters:
-
-- `lr=1.4e-5`, AdamW (β=0.9/0.95, wd=1e-6)
-- `batch_size=128` rollouts, `mini_batch_size=128`, `ppo_epochs=4`
-- `init_kl_coef=0.05`, `target=6` (adaptive KL)
-- `cliprange=0.2`, `cliprange_value=0.2`, `vf_coef=1`
-- Generation: `max_new_tokens=80`, `do_sample=True`, `top_p=1.0`, `top_k=0`
-- Cosine LR decay to 10% of initial over 10,000 steps
-
-## Training Strategy
-
-- **Partial fine-tuning**: only the top 2 of 36 transformer blocks unfrozen, plus the value head. Acts as a regularizer (PPO stability), reduces optimizer memory, and concentrates noisy RL gradients on the most task-relevant params. This is the trlX-style recipe; LoRA would be the modern alternative.
-- **Frozen reference model** + **KL penalty** to keep the policy near base, complementing the layer freezing.
-
-## Issues Found and Fixed
-
-| Problem | Fix |
-|---|---|
-| `cliprange_reward` not in trl | It's a trlX parameter, not HF trl — removed (clip rewards manually if needed) |
-| `PPOTrainer` API mismatch | Pinned `trl==0.11.4`, the last version with the classic API |
-| Disk full (container root, 20 GB) | Moved HF/pip/tmp caches to `/workspace` |
-| torch/torchvision/torchaudio mismatch | Aligned all three to torch 2.4.1 + cu124 |
-| transformers too new for torch 2.4 | Downgraded to transformers 4.45.2 |
-| fsspec/datasets conflict | Unpinned fsspec or pinned to ≤2026.2.0 |
-| **Training silently on CPU** | Added `accelerator_kwargs={"cpu": False}` to `PPOConfig` + device assertion |
-| 50s/step (reward scoring on every sample) | Batched reward pipeline calls (`score_batch`, batch_size=32) |
-| Slow generation | Raised `ppo_trainer.generate(batch_size=32)` from default 4 |
-| LR schedule was a no-op | Fixed `eta_min = lr * 0.1` |
-
-## Reward Model Sanity Check (Done Pre-Training)
-
-Built a `rm_sanity.py` script that scores ~20 good/bad pairs and verifies:
-
-- Mean gap (good − bad) is clearly positive
-- Pairwise win rate > 90%
-- No NaN/Inf, reasonable score range
-- Result: "Looks reasonable — RM separates good from bad" ✅
-
-## W&B Logging
-
-- Enabled via `log_with="wandb"` in PPOConfig
-- CLI args auto-logged to `wandb.config`
-- Heavy query/response text table gated to every N steps; scalars logged every step
-
-## Training Health (after ~75 steps)
-
-| Metric | Reading | Interpretation |
-|---|---|---|
-| `env/reward_mean` | **−0.27 → +0.10** | **PPO is working** — the core signal |
-| `env/reward_std` | ~0.34 → 0.38, stable | Healthy exploration, no mode collapse |
-| `env/reward_dist` | Dark mass shifting up, shape preserved | Distribution improving without collapsing |
-| `ppo/loss/value` | 0.13 → 0.025 | Critic fitting well |
-| `ppo/loss/total` | Dominated by value loss (`vf_coef=1`) | Falling smoothly |
-| `ppo/loss/policy` | ~−0.004 steady | Healthy and small (negative is correct in PPO — see below) |
-| `ppo/val/var_explained` | −3.5 → −0.8 | Critic still catches up from random init; trajectory is right |
-| `ppo/policy/clipfrac` | ~0.001 | Clip almost never binds — updates are very small |
-| `ppo/policy/approxkl` | ~0.0001 | Per-update KL tiny — policy crawls per step |
-
-## Key Insights from the Run
-
-1. **Negative `policy/loss` is correct.** trl reports `-L^CLIP` so the optimizer can minimize it. Negative = the policy is increasing the probability of high-advantage actions. The shape (sharp dip → flat) is steady-state PPO.
-
-2. **The critic lags the policy.** Value head was randomly initialized (the `no v_head weight is found` warning), so `var_explained` starts very negative. It's climbing toward 0 — keep watching.
-
-3. **Updates are extremely conservative.** `clipfrac ≈ 0.001` and `approxkl ≈ 1e-4` are an order of magnitude below the typical PPO sweet spot (clipfrac 0.05–0.25, approxkl ~0.005–0.02). That's the natural consequence of: only 2 blocks unfrozen, lr=1.4e-5, ppo_epochs=4. **Safe but slow.**
-
-4. **Bottleneck migrated.** Was reward scoring (50s/step → ~18s/step after batching). Now the dominant cost is autoregressive generation (80 tokens × 128 sequences). Levers if more speed needed: raise `--gen_batch_size` to 64+, bf16 the policy, shorten `max_new_tokens`.
-
-5. **Loss alone is a poor health signal in PPO.** Reward, KL, clipfrac, and entropy together tell the truth. Loss going down can coexist with policy collapse.
-
-## What to Watch as Training Continues
-
-- `env/reward_mean` — should keep climbing, then plateau
-- `objective/kl` (vs reference, not approxkl) — gradual rise OK, spikes mean drift; the adaptive coef should handle it if `target=6` is right
-- `objective/entropy` — slow decline OK, sudden crash = mode collapse
-- **The actual generated text** in the W&B table — reward going up doesn't guarantee text quality; reward hacking shows up here before it shows up in metrics
-- `ppo/val/var_explained` crossing 0 — the moment the critic becomes genuinely useful
-
-## Headroom If Reward Plateaus
-
-In order of likely impact:
-
-1. `--num_layers_unfrozen 4` or `6` (more capacity)
-2. Raise LR to 5e-5 (clipfrac and approxkl have huge headroom)
-3. Lower `ppo_epochs` to 2 (each batch is barely being squeezed anyway)
-4. Switch to bf16 + larger `gen_batch_size` for wall-clock speed
-5. Consider a LoRA `peft_config` instead of layer freezing — modern equivalent, better capacity/stability tradeoff
-
-## Open Concerns
-
-- **Reward text uses `p + "</s>" + r`** but `p` already ends in `</s>`, producing `</s></s>` — may or may not match how `toloka/prompts_reward_model` was trained. Worth verifying once.
-- **Cosine schedule** decays over 10k steps; if you stop earlier, you got essentially no decay. Adjust `T_max` to match actual run length if relevant.
-- **`ppo_epochs=4` over the same 128 rollouts**, while updates are so small, is doing a lot of work for not much movement — likely overkill at current LR.
-
-Overall: a textbook-healthy PPO run that just needs to keep cooking. The fundamentals (environment, devices, RM behavior, reward signal reaching the policy) are all confirmed working.
-
----
-
-# GRPO Design Decisions (`run_grpo.py`)
-
-## Why GRPO vs PPO
-
-| Dimension | PPO | GRPO |
-|---|---|---|
-| Critic | Separate value head (extra params, warm-up lag) | None — advantage from group statistics |
-| Memory | Model + ref model + value head | Model + ref model only |
-| Variance | Reduced by learned baseline | Reduced by within-group normalisation |
-| Implementation surface | Large (critic loss, GAE, clipping on both policy and value) | Smaller (single clipped surrogate + group z-score) |
-
-GRPO is the natural choice when you want to avoid the critic cold-start problem (the `var_explained` going deeply negative at the start of PPO runs) and when GPU memory is tight enough that eliminating the value head matters.
-
-## Model
-
-`AutoModelForCausalLM` instead of `AutoModelForCausalLMWithValueHead`. No value head is initialised, so there is no noisy random-init phase and no `vf_coef` to tune. The same partial-freeze strategy is kept (top `--num_layers_unfrozen` transformer blocks + `lm_head`).
-
-## Advantage Estimation
-
-For each prompt, G completions are sampled (`--num_generations`, default 8). The advantage for completion _i_ in the group is:
-
-```
-A_i = (r_i − mean(r_1..G)) / std(r_1..G)
-```
-
-This is computed inside `GRPOTrainer`; no external baseline model is needed.
-
-## Hyperparameter Mapping from PPO
-
-| PPO arg | GRPO arg | Notes |
-|---|---|---|
-| `--init_kl_coef 0.05` | `--beta 0.05` | Same KL penalty concept |
-| `--num_rollouts 128` | `--batch_size 16 --num_generations 8` | 16 × 8 = 128 total completions/step |
-| `--chunk_size 128` | N/A | GRPOTrainer handles mini-batching internally |
-| `--ppo_epochs 4` | `--grpo_epochs 1` | GRPO is typically run with 1 inner epoch; the group sampling itself diversifies gradient signal |
-| `--vf_coef 1` | N/A | No value head |
-| `--cliprange 0.2` | `--cliprange 0.2` | Same ratio clip (ε) |
-
-## Trainer
-
-Uses `GRPOTrainer` from `trl >= 0.12.0`. The PPO script is pinned to `trl==0.11.4` (classic API); GRPO requires a separate environment or an upgrade. The two scripts are intentionally independent — no shared state.
-
-W&B is initialised explicitly with `wandb.init()` before constructing `GRPOTrainer` so that `entity`, `tags`, and `config` all attach to the same run. HF's `report_to="wandb"` path doesn't expose those fields.
-
-## Checkpointing
-
-Periodic checkpoints are delegated to HF Trainer's native `save_steps` / `save_total_limit`. Best-reward checkpointing is handled by `BestRewardCheckpointer`, a `TrainerCallback` that reads `rewards/mean` from the logged metrics and saves `best/` whenever a new high is reached (after `--save_best_after` warmup steps). This mirrors the `best/` logic in `run.py`.
-
-## Reward Function
-
-Signature matches the dataset column name: `reward_fn(completions, prompt=..., **kwargs)`. GRPOTrainer repeats each prompt G times before calling the reward function, so `completions` and `prompt` are always the same length. The reward text format (`p + "</s>" + c`) deliberately mirrors `run.py` so reward distributions are directly comparable.
-
-## Trade-offs and Open Questions
-
-- **Group size G=8 with batch_size=16** gives 128 completions/step matching the PPO rollout count, but each prompt now has 8 on-policy samples instead of 1. This increases diversity of the gradient signal at the cost of running the reward model on 8× as many texts per prompt.
-- **`grpo_epochs=1`** is the standard choice. Increasing it reuses the same rollouts for multiple gradient steps (like `ppo_epochs` in PPO) but introduces off-policy error since GRPO's advantage is computed once at rollout time.
-- **No adaptive KL**: PPO uses an adaptive KL controller targeting `kl=6`. GRPO uses a fixed `beta`; if the policy drifts far from reference, `beta` may need manual tuning.
-- **Reward text `</s></s>` double-separator**: inherited from `run.py`. Both scripts have the same potential mismatch with how `toloka/prompts_reward_model` was trained. Verify once before drawing reward-scale comparisons between the two runs.
+The single sentence I'd take away from this: **in PPO, trust the reward curve, the reward distribution shape, and the sampled generations — and treat the loss as an artifact of the algorithm's bookkeeping, not as a measure of progress.**
