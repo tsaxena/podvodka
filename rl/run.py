@@ -40,7 +40,7 @@ def main():
     parser.add_argument("--num_layers_unfrozen", type=int, default=2)
     parser.add_argument("--gen_batch_size", type=int, default=32)
     parser.add_argument("--reward_batch_size", type=int, default=32)
-    parser.add_argument("--num_steps", type=int, default=10000)
+    parser.add_argument("--num_steps", type=int, default=2000)
     parser.add_argument("--train_path", type=str, default="/workspace/podvodka/data/train_strings.csv")
     parser.add_argument("--val_path", type=str, default="/workspace/podvodka/data/val_strings.csv")
     parser.add_argument("--output_path", type=str, default="/workspace/podvodka/models/gpt2-large-rl-prompt-writing")
@@ -117,7 +117,7 @@ def main():
         ppo_epochs=4,
         init_kl_coef=args.init_kl_coef,
         target=6,
-        horizon=10000,
+        horizon=args.num_steps,
         gamma=1,
         lam=0.95,
         cliprange=0.2,

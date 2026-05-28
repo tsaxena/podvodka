@@ -1,3 +1,9 @@
+# RL Training Scripts
+
+Two scripts are provided: `run.py` (PPO) and `run_grpo.py` (GRPO). See per-algorithm sections below.
+
+---
+
 # PPO Setup Summary
 
 ## Environment
@@ -113,3 +119,64 @@ In order of likely impact:
 - **`ppo_epochs=4` over the same 128 rollouts**, while updates are so small, is doing a lot of work for not much movement — likely overkill at current LR.
 
 Overall: a textbook-healthy PPO run that just needs to keep cooking. The fundamentals (environment, devices, RM behavior, reward signal reaching the policy) are all confirmed working.
+
+---
+
+# GRPO Design Decisions (`run_grpo.py`)
+
+## Why GRPO vs PPO
+
+| Dimension | PPO | GRPO |
+|---|---|---|
+| Critic | Separate value head (extra params, warm-up lag) | None — advantage from group statistics |
+| Memory | Model + ref model + value head | Model + ref model only |
+| Variance | Reduced by learned baseline | Reduced by within-group normalisation |
+| Implementation surface | Large (critic loss, GAE, clipping on both policy and value) | Smaller (single clipped surrogate + group z-score) |
+
+GRPO is the natural choice when you want to avoid the critic cold-start problem (the `var_explained` going deeply negative at the start of PPO runs) and when GPU memory is tight enough that eliminating the value head matters.
+
+## Model
+
+`AutoModelForCausalLM` instead of `AutoModelForCausalLMWithValueHead`. No value head is initialised, so there is no noisy random-init phase and no `vf_coef` to tune. The same partial-freeze strategy is kept (top `--num_layers_unfrozen` transformer blocks + `lm_head`).
+
+## Advantage Estimation
+
+For each prompt, G completions are sampled (`--num_generations`, default 8). The advantage for completion _i_ in the group is:
+
+```
+A_i = (r_i − mean(r_1..G)) / std(r_1..G)
+```
+
+This is computed inside `GRPOTrainer`; no external baseline model is needed.
+
+## Hyperparameter Mapping from PPO
+
+| PPO arg | GRPO arg | Notes |
+|---|---|---|
+| `--init_kl_coef 0.05` | `--beta 0.05` | Same KL penalty concept |
+| `--num_rollouts 128` | `--batch_size 16 --num_generations 8` | 16 × 8 = 128 total completions/step |
+| `--chunk_size 128` | N/A | GRPOTrainer handles mini-batching internally |
+| `--ppo_epochs 4` | `--grpo_epochs 1` | GRPO is typically run with 1 inner epoch; the group sampling itself diversifies gradient signal |
+| `--vf_coef 1` | N/A | No value head |
+| `--cliprange 0.2` | `--cliprange 0.2` | Same ratio clip (ε) |
+
+## Trainer
+
+Uses `GRPOTrainer` from `trl >= 0.12.0`. The PPO script is pinned to `trl==0.11.4` (classic API); GRPO requires a separate environment or an upgrade. The two scripts are intentionally independent — no shared state.
+
+W&B is initialised explicitly with `wandb.init()` before constructing `GRPOTrainer` so that `entity`, `tags`, and `config` all attach to the same run. HF's `report_to="wandb"` path doesn't expose those fields.
+
+## Checkpointing
+
+Periodic checkpoints are delegated to HF Trainer's native `save_steps` / `save_total_limit`. Best-reward checkpointing is handled by `BestRewardCheckpointer`, a `TrainerCallback` that reads `rewards/mean` from the logged metrics and saves `best/` whenever a new high is reached (after `--save_best_after` warmup steps). This mirrors the `best/` logic in `run.py`.
+
+## Reward Function
+
+Signature matches the dataset column name: `reward_fn(completions, prompt=..., **kwargs)`. GRPOTrainer repeats each prompt G times before calling the reward function, so `completions` and `prompt` are always the same length. The reward text format (`p + "</s>" + c`) deliberately mirrors `run.py` so reward distributions are directly comparable.
+
+## Trade-offs and Open Questions
+
+- **Group size G=8 with batch_size=16** gives 128 completions/step matching the PPO rollout count, but each prompt now has 8 on-policy samples instead of 1. This increases diversity of the gradient signal at the cost of running the reward model on 8× as many texts per prompt.
+- **`grpo_epochs=1`** is the standard choice. Increasing it reuses the same rollouts for multiple gradient steps (like `ppo_epochs` in PPO) but introduces off-policy error since GRPO's advantage is computed once at rollout time.
+- **No adaptive KL**: PPO uses an adaptive KL controller targeting `kl=6`. GRPO uses a fixed `beta`; if the policy drifts far from reference, `beta` may need manual tuning.
+- **Reward text `</s></s>` double-separator**: inherited from `run.py`. Both scripts have the same potential mismatch with how `toloka/prompts_reward_model` was trained. Verify once before drawing reward-scale comparisons between the two runs.
