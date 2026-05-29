@@ -223,7 +223,7 @@ def train_dpo(args):
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.1,
+        warmup_ratio=0.2,
         logging_steps=10,
         eval_steps=100,
         save_steps=200,
@@ -235,6 +235,7 @@ def train_dpo(args):
         report_to=["wandb"] if not args.no_wandb else [],
         run_name=args.wandb_run_name,
         bf16=True,                       # A100 handles this well
+        max_grad_norm=1.0 
     )
 
     trainer = DPOTrainer(
