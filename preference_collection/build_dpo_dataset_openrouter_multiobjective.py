@@ -27,10 +27,23 @@ Auth:
 
 Example
 -------
-python build_dpo_dataset_openrouter_multiobjective.py \
+# Use your existing 1k × 8 score checkpoint (skip scoring, only rebuild pairs):
+python build_dpo_dataset_openrouter_multiobjective_updated.py \
+    --num_prompts 1000 \
+    --candidates_per_prompt 8 \
+    --skip_generation \
+    --target_pairs 3000 \
+    --max_pairs_per_prompt 4 \
+    --judge_model deepseek/deepseek-r1 \
+    --output_path /workspace/podvodka/data/preferences_openrouter_mo.jsonl
+
+# Full run (generate + score + pair):
+python build_dpo_dataset_openrouter_multiobjective_updated.py \
     --num_prompts 1000 \
     --candidates_per_prompt 8 \
     --judge_model deepseek/deepseek-r1 \
+    --target_pairs 3000 \
+    --max_pairs_per_prompt 4 \
     --output_path /workspace/podvodka/data/preferences_openrouter_mo.jsonl
 """
 
@@ -635,6 +648,157 @@ def _score_payload(item: ScoredItem) -> Dict[str, Any]:
     }
 
 
+def validate_candidate_cache(
+    candidates: List[List[str]],
+    expected_candidates_per_prompt: int,
+) -> None:
+    """Raise if the loaded cache has the wrong number of candidates per prompt.
+
+    Silently reusing a 1×1 or 8×1 cache would produce almost no pairs without
+    a clear error message.  Better to fail fast.
+    """
+    bad = [
+        (i, len(c))
+        for i, c in enumerate(candidates)
+        if len(c) != expected_candidates_per_prompt
+    ]
+    if bad:
+        example_indices = bad[:5]
+        raise ValueError(
+            f"[cache] candidate count mismatch for {len(bad)} prompt(s). "
+            f"Expected {expected_candidates_per_prompt} per prompt. "
+            f"First bad entries (prompt_idx, actual_count): {example_indices}. "
+            f"Delete the cache or set --candidates_per_prompt to match."
+        )
+    print(
+        f"[cache] validated: {len(candidates)} prompts × "
+        f"{expected_candidates_per_prompt} candidates each."
+    )
+
+
+def _build_pairs_for_prompt(
+    pi: int,
+    prompt: str,
+    comps: List[str],
+    items_by_key: Dict[Tuple[int, int], "ScoredItem"],
+    min_score_gap: int,
+    min_chosen_fidelity: int,
+    min_chosen_style_fit: int,
+    min_chosen_non_genericness: int,
+    min_chosen_anti_magic_word_score: int,
+    min_chosen_coherence: int,
+    hard_failure_modes: List[str],
+    max_pairs_per_prompt: int,
+) -> Tuple[List[Dict], Dict[str, int]]:
+    """Return up to *max_pairs_per_prompt* high-confidence pairs for one prompt.
+
+    Candidates are ranked by overall score (descending).  We try every
+    (higher-ranked, lower-ranked) combination in score order and keep the first
+    *max_pairs_per_prompt* that pass all guardrails.  This means the pairs are
+    ordered by quality: the best-vs-worst pair comes first, followed by
+    progressively less extreme but still valid contrasts.
+    """
+    skip_reasons: Dict[str, int] = {}
+
+    scored_cands = [
+        (ci, items_by_key.get((pi, ci))) for ci in range(len(comps))
+    ]
+    scored_cands = [(ci, item) for ci, item in scored_cands if item is not None]
+    if len(scored_cands) < 2:
+        skip_reasons["too_few_scores"] = 1
+        return [], skip_reasons
+
+    # Sort highest → lowest overall score.
+    scored_cands.sort(key=lambda x: _item_score(x[1]) or -1, reverse=True)
+
+    # Assign rank positions (0 = best) so we can record them in audit metadata.
+    rank_map: Dict[int, int] = {ci: rank for rank, (ci, _) in enumerate(scored_cands)}
+
+    pairs: List[Dict] = []
+    used_chosen: set = set()   # avoid repeating the same chosen completion
+    used_rejected: set = set() # avoid repeating the same rejected completion
+
+    for chosen_rank, (chosen_ci, chosen_item) in enumerate(scored_cands):
+        if len(pairs) >= max_pairs_per_prompt:
+            break
+        if chosen_ci in used_chosen:
+            continue
+
+        chosen_score = _item_score(chosen_item)
+        if chosen_score is None:
+            continue
+
+        ok, reason = _passes_chosen_guardrails(
+            chosen_item,
+            min_chosen_fidelity=min_chosen_fidelity,
+            min_chosen_style_fit=min_chosen_style_fit,
+            min_chosen_non_genericness=min_chosen_non_genericness,
+            min_chosen_anti_magic_word_score=min_chosen_anti_magic_word_score,
+            min_chosen_coherence=min_chosen_coherence,
+            hard_failure_modes=hard_failure_modes,
+        )
+        if not ok:
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            continue
+
+        # Try rejected candidates from the bottom of the ranking upward.
+        for rejected_rank in range(len(scored_cands) - 1, chosen_rank, -1):
+            if len(pairs) >= max_pairs_per_prompt:
+                break
+            rejected_ci, rejected_item = scored_cands[rejected_rank]
+            if rejected_ci in used_rejected:
+                continue
+
+            rejected_score = _item_score(rejected_item)
+            if rejected_score is None:
+                continue
+
+            gap = chosen_score - rejected_score
+            if gap < min_score_gap:
+                skip_reasons["gap_too_small"] = skip_reasons.get("gap_too_small", 0) + 1
+                continue
+
+            ok, reason = _candidate_beats_on_core_objectives(chosen_item, rejected_item)
+            if not ok:
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                continue
+
+            # Determine pair quality label.
+            if chosen_rank == 0 and rejected_rank == len(scored_cands) - 1:
+                pair_quality = "best_vs_worst"
+            elif gap >= 4:
+                pair_quality = "high_contrast"
+            elif gap >= 2:
+                pair_quality = "medium_contrast"
+            else:
+                pair_quality = "low_contrast"
+
+            pairs.append({
+                "prompt": prompt,
+                "chosen": comps[chosen_ci],
+                "rejected": comps[rejected_ci],
+
+                # Legacy fields kept for train_dpo.py compatibility.
+                "chosen_score": chosen_score,
+                "rejected_score": rejected_score,
+                "score_gap": gap,
+
+                # Audit metadata.
+                "chosen_candidate_id": chosen_ci,
+                "rejected_candidate_id": rejected_ci,
+                "chosen_rank_by_overall": rank_map[chosen_ci],
+                "rejected_rank_by_overall": rank_map[rejected_ci],
+                "pair_quality": pair_quality,
+                "chosen_scores": _score_payload(chosen_item),
+                "rejected_scores": _score_payload(rejected_item),
+            })
+            used_chosen.add(chosen_ci)
+            used_rejected.add(rejected_ci)
+            break  # one rejected per chosen; move to next chosen tier
+
+    return pairs, skip_reasons
+
+
 def build_pairs(
     prompts: List[str],
     candidates: List[List[str]],
@@ -646,87 +810,93 @@ def build_pairs(
     min_chosen_anti_magic_word_score: int,
     min_chosen_coherence: int,
     hard_failure_modes: List[str],
+    target_pairs: int = 3000,
+    max_pairs_per_prompt: int = 4,
 ) -> List[Dict]:
+    """Build up to *target_pairs* DPO pairs with prompt diversity.
+
+    Strategy
+    --------
+    For each prompt we attempt to create up to *max_pairs_per_prompt* valid
+    pairs by considering all (chosen, rejected) combinations in score order,
+    not just the single best-vs-worst pair.
+
+    To keep prompt diversity we allocate pairs in round-robin fashion: one
+    pass across all prompts granting each prompt one pair slot at a time, up
+    to *max_pairs_per_prompt*, until *target_pairs* is reached.  This prevents
+    a few prompts with many valid contrasts from dominating the dataset.
+    """
     items_by_key: Dict[Tuple[int, int], ScoredItem] = {}
     for s in scored:
         if _item_score(s) is not None:
             items_by_key[(s.prompt_id, s.candidate_id)] = s
 
-    pairs = []
+    # Build all candidate pairs per prompt up front.
+    per_prompt_pairs: List[List[Dict]] = []
+    aggregate_skip_reasons: Dict[str, int] = {}
     skipped_no_scores = 0
-    skipped_small_gap = 0
-    skipped_guardrail = 0
-    skipped_core_loss = 0
-    skip_reasons: Dict[str, int] = {}
 
     for pi, (prompt, comps) in enumerate(zip(prompts, candidates)):
-        scored_cands = [
-            (ci, items_by_key.get((pi, ci))) for ci in range(len(comps))
-        ]
-        scored_cands = [(ci, item) for ci, item in scored_cands if item is not None]
-        if len(scored_cands) < 2:
-            skipped_no_scores += 1
-            continue
-
-        best_ci, best_item = max(scored_cands, key=lambda x: _item_score(x[1]) or -1)
-        worst_ci, worst_item = min(scored_cands, key=lambda x: _item_score(x[1]) or 999)
-        best_score = _item_score(best_item)
-        worst_score = _item_score(worst_item)
-        if best_score is None or worst_score is None:
-            skipped_no_scores += 1
-            continue
-
-        gap = best_score - worst_score
-        if gap < min_score_gap:
-            skipped_small_gap += 1
-            continue
-
-        ok, reason = _passes_chosen_guardrails(
-            best_item,
+        prompt_pairs, skip_reasons = _build_pairs_for_prompt(
+            pi=pi,
+            prompt=prompt,
+            comps=comps,
+            items_by_key=items_by_key,
+            min_score_gap=min_score_gap,
             min_chosen_fidelity=min_chosen_fidelity,
             min_chosen_style_fit=min_chosen_style_fit,
             min_chosen_non_genericness=min_chosen_non_genericness,
             min_chosen_anti_magic_word_score=min_chosen_anti_magic_word_score,
             min_chosen_coherence=min_chosen_coherence,
             hard_failure_modes=hard_failure_modes,
+            max_pairs_per_prompt=max_pairs_per_prompt,
         )
-        if not ok:
-            skipped_guardrail += 1
-            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-            continue
+        per_prompt_pairs.append(prompt_pairs)
+        if "too_few_scores" in skip_reasons:
+            skipped_no_scores += 1
+        for reason, count in skip_reasons.items():
+            if reason != "too_few_scores":
+                aggregate_skip_reasons[reason] = (
+                    aggregate_skip_reasons.get(reason, 0) + count
+                )
 
-        ok, reason = _candidate_beats_on_core_objectives(best_item, worst_item)
-        if not ok:
-            skipped_core_loss += 1
-            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-            continue
+    # Round-robin allocation: one pair slot per prompt per pass until
+    # target_pairs is reached or all prompts are exhausted.
+    pairs: List[Dict] = []
+    slot = 0
+    while len(pairs) < target_pairs and slot < max_pairs_per_prompt:
+        added_this_pass = 0
+        for prompt_pairs in per_prompt_pairs:
+            if len(pairs) >= target_pairs:
+                break
+            if slot < len(prompt_pairs):
+                pairs.append(prompt_pairs[slot])
+                added_this_pass += 1
+        if added_this_pass == 0:
+            break  # no more pairs available from any prompt
+        slot += 1
 
-        pairs.append({
-            "prompt": prompt,
-            "chosen": comps[best_ci],
-            "rejected": comps[worst_ci],
+    total_available = sum(len(pp) for pp in per_prompt_pairs)
+    prompts_with_pairs = sum(1 for pp in per_prompt_pairs if pp)
 
-            # Keep legacy fields for train_dpo.py compatibility and quick audits.
-            "chosen_score": best_score,
-            "rejected_score": worst_score,
-            "score_gap": gap,
-
-            # New audit metadata.
-            "chosen_candidate_id": best_ci,
-            "rejected_candidate_id": worst_ci,
-            "chosen_scores": _score_payload(best_item),
-            "rejected_scores": _score_payload(worst_item),
-        })
-
-    print(f"[pairs] built {len(pairs)} pairs")
+    print(f"[pairs] built {len(pairs)} pairs "
+          f"(target={target_pairs}, available={total_available}, "
+          f"prompts_with_at_least_one_pair={prompts_with_pairs}/{len(prompts)})")
     print(f"[pairs]   skipped {skipped_no_scores} prompts with < 2 valid scores")
-    print(f"[pairs]   skipped {skipped_small_gap} prompts with gap < {min_score_gap}")
-    print(f"[pairs]   skipped {skipped_guardrail} prompts where best candidate failed guardrails")
-    print(f"[pairs]   skipped {skipped_core_loss} prompts where chosen lost a core objective")
-    if skip_reasons:
-        print("[pairs] skip reasons:")
-        for reason, count in sorted(skip_reasons.items(), key=lambda x: -x[1]):
+    if aggregate_skip_reasons:
+        print("[pairs] skip reasons across all prompts:")
+        for reason, count in sorted(aggregate_skip_reasons.items(), key=lambda x: -x[1]):
             print(f"  {reason}: {count}")
+
+    # Pair quality breakdown.
+    quality_counts: Dict[str, int] = {}
+    for pair in pairs:
+        q = pair.get("pair_quality", "unknown")
+        quality_counts[q] = quality_counts.get(q, 0) + 1
+    print("[pairs] pair quality breakdown:")
+    for q, count in sorted(quality_counts.items(), key=lambda x: -x[1]):
+        print(f"  {q}: {count}")
+
     return pairs
 
 
@@ -860,6 +1030,12 @@ def main():
     p.add_argument("--min_chosen_coherence", type=int, default=6)
     p.add_argument("--hard_failure_modes", default=",".join(DEFAULT_HARD_FAILURE_MODES),
                    help="Comma-separated failure modes that disqualify a chosen candidate.")
+    p.add_argument("--target_pairs", type=int, default=3000,
+                   help="Stop collecting pairs once this many have been assembled. "
+                        "Round-robin allocation across prompts keeps diversity.")
+    p.add_argument("--max_pairs_per_prompt", type=int, default=4,
+                   help="Maximum DPO pairs extracted from a single prompt. "
+                        "Each pair uses a distinct (chosen, rejected) candidate combination.")
     p.add_argument("--skip_generation", action="store_true")
 
     args = p.parse_args()
@@ -894,6 +1070,10 @@ def main():
             for p_text, comps in zip(prompts, candidates):
                 f.write(json.dumps({"prompt": p_text, "candidates": comps}) + "\n")
         print(f"[gen] wrote candidates to {cand_path}")
+
+    # Validate the cache has the right shape — fail fast rather than silently
+    # producing a near-empty dataset from a mismatched cache file.
+    validate_candidate_cache(candidates, args.candidates_per_prompt)
 
     # ---- Build OpenRouter request extras ----
     extra_body = None
@@ -954,6 +1134,8 @@ def main():
         min_chosen_anti_magic_word_score=args.min_chosen_anti_magic_word_score,
         min_chosen_coherence=args.min_chosen_coherence,
         hard_failure_modes=hard_failure_modes,
+        target_pairs=args.target_pairs,
+        max_pairs_per_prompt=args.max_pairs_per_prompt,
     )
     write_pairs(pairs, Path(args.output_path))
     write_audit_sample(pairs, Path(args.audit_path) if args.audit_path else None, args.audit_n)
