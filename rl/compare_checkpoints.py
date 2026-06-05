@@ -15,8 +15,6 @@ Example
 python compare_checkpoints.py \\
     --checkpoints \\
         base:tsaxena/gpt2-large-prompt-tags \\
-        early:/workspace/podvodka/models/gpt2-large-rl-prompt-writing/step-000100 \\
-        mid:/workspace/podvodka/models/gpt2-large-rl-prompt-writing/step-000200 \\
         best:/workspace/podvodka/models/gpt2-large-rl-prompt-writing/best \\
     --val_path /workspace/podvodka/data/val_strings.csv \\
     --num_prompts 30 \\
