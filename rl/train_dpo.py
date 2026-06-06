@@ -228,7 +228,7 @@ def train_dpo(args):
         eval_steps=100,
         save_steps=200,
         save_total_limit=3,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         beta=args.beta,                  # DPO temperature; 0.1 is standard
         max_length=args.max_length,
         max_prompt_length=args.max_prompt_length,

@@ -254,6 +254,47 @@ This folder contains scripts for the preference collection for the reward model 
 
 
 
+# Corrected RM Preference Collection
+
+## Pipeline
+
+1. Generate K candidates per prompt with the SFT model (or load from `--candidates_cache`)
+2. Score with `toloka/prompts_reward_model` (batched, checkpoint-resumable via `--rm_score_cache`)
+3. Normalize raw RM logits within each prompt group using z-score + sigmoid
+4. Correct scores with `corrected_reward()` from the existing module — subtracts `hack_word_penalty`, `repetition_penalty`, `length_bloat_penalty`, and applies hard-gate `-1.0` for egregious failures
+5. Pair & diversify, then write JSONL
+
+## Diversity mechanisms
+
+| Mechanism | What it does |
+|---|---|
+| Jaccard deduplication | Collapses candidates with >80% token overlap (keep best-scoring one) |
+| Multi-strategy pairing | Best vs worst, best vs 2nd-worst, 2nd-best vs worst, ... up to `--max_pairs_per_prompt` |
+| Round-robin budget | Distributes `--target_pairs` evenly across prompts so no prompt crowds others |
+| `--min_score_gap` | Only pairs where corrected scores differ enough to give a clean training signal |
+
+## Audit trail
+
+Every output pair includes `chosen_audit` / `rejected_audit` dicts with per-component penalty breakdowns, and `chosen_raw_rm` / `rejected_raw_rm` so you can see exactly how much the correction changed the ranking.
+
+## Quickstart
+
+```bash
+# Full run
+python preference_collection/collect_dpo_corrected_rm.py \
+    --num_prompts 2000 \
+    --candidates_per_prompt 8 \
+    --output_path data/preferences_corrected_rm.jsonl
+
+# Resume / rebuild pairs only (scoring already cached)
+python preference_collection/collect_dpo_corrected_rm.py \
+    --skip_generation --skip_scoring \
+    --min_score_gap 0.10 \
+    --output_path data/preferences_corrected_rm.jsonl
+```
+
+---
+
 # LLM Judge Data Collection
 ```
 python build_dpo_dataset_openrouter_multiobjective.py \
