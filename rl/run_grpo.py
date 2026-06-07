@@ -230,6 +230,11 @@ def main():
         report_to=report_to,
         save_steps=args.save_every if args.save_every > 0 else args.num_steps + 1,
         save_total_limit=args.keep_last_n,
+        # Keep the 'prompt' column so it reaches the reward function.
+        # TrainingArguments defaults remove_unused_columns=True, which would
+        # drop 'prompt' after tokenisation — leaving reward_fn(prompt=None)
+        # and crashing the zip inside it.
+        remove_unused_columns=False,
     )
 
     best_reward_cb = BestRewardCheckpointer(
