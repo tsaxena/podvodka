@@ -61,7 +61,7 @@ def generate_candidates(model, tokenizer, prompts: List[str], k: int,
             pad_token_id=tokenizer.pad_token_id,
         )
         completions = [
-            tokenizer.decode(g[ids.shape[1]:], skip_special_tokens=False)
+            tokenizer.decode(g[ids.shape[1]:], skip_special_tokens=True)
             for g in generated
         ]
         out.append(completions)
@@ -182,11 +182,28 @@ def load_dataset_from_jsonl(path: str) -> Dataset:
     with open(path) as f:
         for line in f:
             d = json.loads(line)
-            # DPOTrainer expects 'prompt', 'chosen', 'rejected' columns
+            prompt = d["prompt"].rstrip()
+            # Strip </s> from the prompt end (present or not).
+            # Then unconditionally prepend it to both completions.
+            #
+            # Why: TRL checks tokenize(prompt) == prefix(tokenize(prompt+comp)).
+            # If the prompt ends with '>' (from </s>) and the completion starts
+            # with a letter, GPT-2's BPE may merge '>'+letter into one token
+            # (e.g. ">in"), making the prompt's trailing '>' disappear from the
+            # aligned prefix → mismatch warning.
+            # With the prompt ending on a plain word token (e.g. "Ġhorse"),
+            # nothing merges across the prompt/completion boundary because
+            # "Ġhorse" + "<" never forms a BPE pair in GPT-2's vocabulary.
+            # Mathematically equivalent: the </s> token appears in both chosen
+            # and rejected so its log-prob contribution cancels in the DPO loss.
+            if prompt.endswith("</s>"):
+                prompt = prompt[:-len("</s>")]
+            chosen = "</s>" + d["chosen"].replace("<|endoftext|>", "").strip()
+            rejected = "</s>" + d["rejected"].replace("<|endoftext|>", "").strip()
             rows.append({
-                "prompt": d["prompt"],
-                "chosen": d["chosen"],
-                "rejected": d["rejected"],
+                "prompt": prompt,
+                "chosen": chosen,
+                "rejected": rejected,
             })
     return Dataset.from_list(rows)
 
@@ -223,19 +240,22 @@ def train_dpo(args):
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.2,
+        warmup_steps=50,
         logging_steps=10,
-        eval_steps=100,
-        save_steps=200,
-        save_total_limit=3,
         eval_strategy="steps",
-        beta=args.beta,                  # DPO temperature; 0.1 is standard
+        eval_steps=500,          # evaluate less frequently
+        save_strategy="best",    # only save when eval_loss improves
+        save_total_limit=2,
+        save_only_model=True,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        beta=args.beta,
         max_length=args.max_length,
-        max_prompt_length=args.max_prompt_length,
         report_to=["wandb"] if not args.no_wandb else [],
         run_name=args.wandb_run_name,
-        bf16=True,                       # A100 handles this well
-        max_grad_norm=1.0 
+        bf16=True,
+        max_grad_norm=1.0,
     )
 
     trainer = DPOTrainer(
@@ -244,7 +264,7 @@ def train_dpo(args):
         args=dpo_config,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
     )
 
     trainer.train()
