@@ -39,6 +39,12 @@ Usage:
         --device cuda \\
         --llm-model "anthropic/claude-3.5-haiku" \\
         --vqa-model "qwen/qwen3-vl-32b-instruct"
+
+    # Enrich prompt before image generation (base / dpo / ppo)
+    python dsg.py --prompt "a red car next to a blue bicycle" \\
+        --enrich-method ppo \\
+        --enrich-device cpu \\
+        --enrich-max-tokens 80
 """
 
 import argparse
@@ -99,6 +105,92 @@ def generate_sd_image(prompt: str, save_path: str,
     image.save(save_path)
     print(f"[SD] Saved to {save_path}")
     return save_path
+
+# ---------------------------------------------------------------------------
+# Prompt enrichment via local GPT-2 models (base / DPO / PPO)
+# ---------------------------------------------------------------------------
+
+BASE_ENRICH_MODEL = "tsaxena/gpt2-large-prompt-tags"
+PPO_ENRICH_MODEL  = "tsaxena/gpt2-large-ppo-prompt-tags"
+DPO_ENRICH_MODEL  = "tsaxena/gpt2-large-dpo-corrected"
+
+_enrich_cache: dict = {}  # {model_path: (model, tokenizer)} — loaded once per process
+
+
+def _load_enrich_model(model_path: str, device: str):
+    """Load and cache a causal-LM enrichment model from HuggingFace."""
+    if model_path in _enrich_cache:
+        return _enrich_cache[model_path]
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError:
+        sys.exit("Error: transformers and torch are required for prompt enrichment.\n"
+                 "Install with: pip install transformers torch accelerate")
+
+    import torch  # noqa: F811 (re-import after guard for type checker)
+    print(f"[Enrich] Loading {model_path} on {device} …")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, truncation_side="right")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16 if "cuda" in device else torch.float32,
+        low_cpu_mem_usage=True,
+    ).to(device).eval()
+
+    _enrich_cache[model_path] = (model, tokenizer)
+    return model, tokenizer
+
+
+def enrich_prompt(prompt: str, method: str = "ppo", device: str = "cpu",
+                  max_new_tokens: int = 80) -> str:
+    """
+    Enrich a text-to-image prompt using a fine-tuned GPT-2 model.
+
+    method:
+        "base" — tsaxena/gpt2-large-prompt-tags       (SFT baseline)
+        "ppo"  — tsaxena/gpt2-large-ppo-prompt-tags   (PPO-optimised)
+        "dpo"  — tsaxena/gpt2-large-dpo-corrected     (DPO-optimised)
+
+    Model input format : "<prompt></s>"
+    Model output       : enrichment tags appended after the separator
+    Returns            : "<original prompt>, <generated tags>"
+    """
+    model_map = {
+        "base": BASE_ENRICH_MODEL,
+        "ppo":  PPO_ENRICH_MODEL,
+        "dpo":  DPO_ENRICH_MODEL,
+    }
+    if method not in model_map:
+        raise ValueError(f"Unknown enrich method {method!r}; choose from {list(model_map)}")
+
+    import torch
+    model_path = model_map[method]
+    model, tokenizer = _load_enrich_model(model_path, device)
+
+    input_text = f"{prompt}</s>"
+    enc = tokenizer(input_text, return_tensors="pt",
+                    truncation=True, max_length=512).to(device)
+
+    with torch.no_grad():
+        out = model.generate(
+            **enc,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            top_k=0,
+            top_p=1.0,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+    new_tokens = out[0, enc["input_ids"].shape[1]:]
+    tags = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+    enriched = f"{prompt}, {tags}" if tags else prompt
+    print(f"[Enrich/{method.upper()}] Original : {prompt!r}")
+    print(f"[Enrich/{method.upper()}] Enriched : {enriched!r}")
+    return enriched
 
 # ---------------------------------------------------------------------------
 # LLM prompts (adapted from DSG paper / repo)
@@ -468,6 +560,20 @@ def main():
     parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL,    help="OpenRouter model for LLM steps")
     parser.add_argument("--vqa-model", default=DEFAULT_VQA_MODEL,    help="OpenRouter model for VQA step")
     parser.add_argument("--api-key",   default=os.environ.get("OPENROUTER_API_KEY"), help="OpenRouter API key")
+
+    enrich_group = parser.add_argument_group("prompt enrichment")
+    enrich_group.add_argument(
+        "--enrich-method", default="none",
+        choices=["none", "base", "dpo", "ppo"],
+        help="Enrich the prompt before image generation using a fine-tuned GPT-2 model. "
+             "'base'=SFT, 'dpo'=DPO-optimised, 'ppo'=PPO-optimised (default: none)")
+    enrich_group.add_argument(
+        "--enrich-device", default="cpu",
+        help="Device for the enrichment model (default: cpu)")
+    enrich_group.add_argument(
+        "--enrich-max-tokens", type=int, default=80,
+        help="Max new tokens to generate for enrichment tags (default: 80)")
+
     args = parser.parse_args()
 
     if not args.api_key:
@@ -482,17 +588,30 @@ def main():
         save_path = image_path if image_path else f"dsg_generated_{index}.png"
         return generate_sd_image(prompt, save_path, args.sd_model, args.device)
 
+    def maybe_enrich(prompt: str) -> str:
+        """Return enriched prompt if --enrich-method is set, otherwise the original."""
+        if args.enrich_method == "none":
+            return prompt
+        return enrich_prompt(prompt, method=args.enrich_method,
+                             device=args.enrich_device,
+                             max_new_tokens=args.enrich_max_tokens)
+
     if args.prompt:
-        image_path = resolve_image(args.prompt, args.image, index=0)
-        results = [evaluate(args.prompt, image_path, client, args.llm_model, args.vqa_model)]
+        gen_prompt = maybe_enrich(args.prompt)
+        image_path = resolve_image(gen_prompt, args.image, index=0)
+        res = evaluate(args.prompt, image_path, client, args.llm_model, args.vqa_model)
+        res["enriched_prompt"] = gen_prompt
+        results = [res]
     else:
         import csv
         results = []
         with open(args.csv, newline="") as f:
             for i, row in enumerate(csv.DictReader(f)):
                 prompt     = row["prompt"].strip()
-                image_path = resolve_image(prompt, row.get("image_path", "").strip(), index=i)
+                gen_prompt = maybe_enrich(prompt)
+                image_path = resolve_image(gen_prompt, row.get("image_path", "").strip(), index=i)
                 res = evaluate(prompt, image_path, client, args.llm_model, args.vqa_model)
+                res["enriched_prompt"] = gen_prompt
                 results.append(res)
 
     with open(args.output, "w") as f:
