@@ -12,6 +12,7 @@ Requires trl >= 0.12.0 (GRPOTrainer / GRPOConfig).
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional
 
@@ -29,6 +30,12 @@ import pandas as pd
 from datasets import Dataset
 
 from trl import GRPOConfig, GRPOTrainer
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from reward_model.corrected_reward_model import (  # noqa: E402
+    corrected_reward,
+    normalize_scores_per_prompt,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +183,46 @@ def main():
             batch_size=args.reward_batch_size,
             truncation=True,
         )
-        return [o["score"] for o in outputs]
+        raw_scores = [o["score"] for o in outputs]
+
+        # Apply corrected reward: normalize per-prompt group then apply
+        # hack/repetition/length penalties (mirrors build_pairs.py Phase 3).
+        G = args.num_generations
+        n = len(completions)
+        corrected_scores: List[float] = [0.0] * n
+
+        # Process full groups of G completions (one per prompt in the batch).
+        n_full = (n // G) * G
+        for start in range(0, n_full, G):
+            end = start + G
+            group_raw = raw_scores[start:end]
+            group_comps = completions[start:end]
+            # Each prompt appears G times consecutively; strip trailing </s> tag.
+            user_prompt = prompt[start].rstrip("</s>").strip()
+
+            norm_scores = normalize_scores_per_prompt(group_raw)
+            for i, (comp, norm_s) in enumerate(zip(group_comps, norm_scores)):
+                corr, _ = corrected_reward(
+                    user_prompt=user_prompt,
+                    candidate=comp,
+                    poor_reward_norm=norm_s,
+                )
+                corrected_scores[start + i] = corr
+
+        # Handle any remainder (edge case — should not occur in normal GRPO batches).
+        if n_full < n:
+            remainder_raw = raw_scores[n_full:]
+            norm_scores = normalize_scores_per_prompt(remainder_raw)
+            user_prompt = prompt[n_full].rstrip("</s>").strip()
+            for i, (comp, norm_s) in enumerate(zip(completions[n_full:], norm_scores)):
+                corr, _ = corrected_reward(
+                    user_prompt=user_prompt,
+                    candidate=comp,
+                    poor_reward_norm=norm_s,
+                )
+                corrected_scores[n_full + i] = corr
+
+        return corrected_scores
 
     # ---- Dataset ----
     train_df = pd.read_csv(args.train_path)
