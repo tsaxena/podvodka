@@ -193,3 +193,20 @@ python compare_checkpoints_dpo.py \
     --base_path tsaxena/gpt2-large-prompt-tags \
     --val_path  /workspace/podvodka/data/val_strings.csv
 ```
+
+
+
+```
+python run_grpo.py \
+  --beta 0.05 \
+  --log_completions \
+  --save_best_min_interval 100 \
+  --local_scratch_dir /tmp/grpo_scratch \
+  --train_path /workspace/podvodka/data/train_strings.csv \
+  --val_path /workspace/podvodka/data/val_strings.csv \
+  --output_path /workspace/podvodka/models/gpt2-large-grpo-prompt-writing \
+  --reward_model_path toloka/prompts_reward_model \
+  --base_model_path tsaxena/gpt2-large-prompt-tags \
+  --wandb_project podvodka-rl \
+  --wandb_run_name grpo-beta0.05-guarded-v2
+```
