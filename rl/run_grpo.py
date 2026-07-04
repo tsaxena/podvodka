@@ -269,6 +269,69 @@ class BestRewardCheckpointer(TrainerCallback):
             t.join(timeout=timeout)
 
 
+class CompletionsPruner(TrainerCallback):
+    """Deletes old local completions/*.parquet files, keeping only the most recent N.
+
+    Root-cause finding from the previous run: with --log_completions and logging_steps=1,
+    TRL writes a NEW parquet file (completions_00001.parquet, completions_00002.parquet, ...)
+    to {output_dir}/completions/ on every single step. Over a 10,000-step run that's 10,000
+    files accumulating in one directory — a strong suspect for the sustained, monotonic
+    step_time drift observed (roughly 2.5s -> 5-6s over the run), since per-file create/open
+    operations tend to degrade as directory entry counts grow on many filesystems. This isn't
+    needed for anything downstream (the full completions history already lives in W&B, which
+    doesn't share this local-directory-growth problem), so pruning is safe.
+
+    Deletion (glob + sort + unlink) is cheap relative to a training step, so this runs
+    synchronously on the main thread rather than needing its own background thread.
+    """
+
+    def __init__(self, completions_dir: Path, keep_last_n: int = 20, check_every: int = 50):
+        self.completions_dir = completions_dir
+        self.keep_last_n = keep_last_n
+        self.check_every = check_every
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if state.global_step % self.check_every != 0:
+            return
+        if not self.completions_dir.is_dir():
+            return
+        files = sorted(self.completions_dir.glob("completions_*.parquet"))
+        excess = files[: max(0, len(files) - self.keep_last_n)]
+        for f in excess:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        if excess:
+            print(f"[completions-pruner] step {state.global_step}: removed {len(excess)} old "
+                  f"completions files, keeping last {self.keep_last_n}")
+
+
+# ---------------------------------------------------------------------------
+# Reward-function helpers
+# ---------------------------------------------------------------------------
+
+def _repeated_trigram_fraction(text: str) -> float:
+    """Fraction of word-trigrams in `text` that are repeats of an earlier trigram.
+
+    Cheap, dependency-free proxy for "this completion degenerated into repetition"
+    (e.g. the "ghost ghost with stylized skeleton" pattern seen in clipped completions
+    from the previous run). 0.0 = no repeated trigrams, up towards 1.0 = highly repetitive.
+    Completions shorter than 3 words return 0.0 (nothing to measure repetition over).
+    """
+    words = text.split()
+    if len(words) < 3:
+        return 0.0
+    trigrams = [tuple(words[i:i + 3]) for i in range(len(words) - 2)]
+    seen = set()
+    repeated = 0
+    for tg in trigrams:
+        if tg in seen:
+            repeated += 1
+        seen.add(tg)
+    return repeated / len(trigrams)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -313,6 +376,39 @@ def main():
                              "multiple of the rolling median of recent non-exploded steps.")
     parser.add_argument("--kl_guard_disable", action="store_true",
                         help="Disable the KL-explosion guard entirely (use plain GRPOTrainer).")
+
+    # ---- Reward function robustness (added after reviewing a full 10k-step run) ----
+    parser.add_argument("--empty_completion_penalty", type=float, default=-1.0,
+                        help="Reward forced for empty/whitespace-only completions, overriding "
+                             "whatever the reward model outputs. Found in the previous run: an "
+                             "empty completion scored +0.114 from the reward model — it's "
+                             "out-of-distribution input the reward model wasn't trained to "
+                             "judge sensibly, so don't trust its score there. Set to a value "
+                             "at or below --reward_clip's lower bound so it's unambiguously "
+                             "the worst outcome in each group. Ignored if "
+                             "--disable_empty_completion_penalty is set.")
+    parser.add_argument("--disable_empty_completion_penalty", action="store_true",
+                        help="Skip the empty-completion override entirely (use the reward "
+                             "model's raw score, unmodified, even for empty completions) — "
+                             "matches the original (pre-fix) behavior exactly. This override "
+                             "isn't just a scoring correction: it participates in the "
+                             "group-relative advantage calculation, so forcing one group "
+                             "member's reward can shift every other member's advantage in that "
+                             "group too. Use this flag for a true apples-to-apples ablation "
+                             "against a run that predates this fix.")
+    parser.add_argument("--repetition_penalty_weight", type=float, default=0.15,
+                        help="Subtracted from reward in proportion to the fraction of repeated "
+                             "word-trigrams in a completion. Found in the previous run: the "
+                             "longest (most-clipped) completions consistently degraded into "
+                             "repetition (e.g. 'ghost ghost') and scored worst — this makes "
+                             "that failure mode more directly penalized rather than relying on "
+                             "the reward model to catch it indirectly. Set to 0 to disable.")
+    parser.add_argument("--clipped_completion_penalty", type=float, default=0.1,
+                        help="Flat penalty subtracted from reward for completions that hit "
+                             "--max_new_tokens without producing an EOS (approximated by "
+                             "retokenized length >= max_new_tokens, since reward_fn only sees "
+                             "text). Nudges the policy toward wrapping up within budget rather "
+                             "than rambling to the cap. Set to 0 to disable.")
 
     # ---- Generation ----
     parser.add_argument("--max_new_tokens", type=int, default=80)
@@ -366,6 +462,13 @@ def main():
                              "every step) — useful briefly, but overwhelming over a long run. "
                              "Off by default: completions still go to the W&B table, just not "
                              "the terminal. Pass this to get the console dump back too.")
+    parser.add_argument("--completions_keep_last_n", type=int, default=20,
+                        help="With --log_completions, TRL writes a new local parquet file to "
+                             "{local_scratch_dir}/completions/ on every step — 10,000 files "
+                             "over a full run. This is a suspected cause of the sustained "
+                             "step_time drift seen in the previous run (directory-growth "
+                             "slowdown). Only the most recent N such files are kept; full "
+                             "history is unaffected since it's already in the W&B table.")
 
     # ---- W&B ----
     parser.add_argument("--wandb_project", type=str, default="podvodka-rl")
@@ -435,6 +538,33 @@ def main():
             # A single outlier logit inside a small generation group (num_generations)
             # can otherwise dominate the group_mean/group_std used for advantages.
             scores = [max(-args.reward_clip, min(args.reward_clip, s)) for s in scores]
+
+        # --- Robustness fixes added after reviewing a full 10k-step run ---
+        for i, completion in enumerate(completions):
+            if not completion.strip() and not args.disable_empty_completion_penalty:
+                # Empty completions are out-of-distribution for the reward model — it isn't
+                # trained to judge them sensibly, and in the previous run one scored +0.114.
+                # Override rather than trust the reward model here.
+                scores[i] = args.empty_completion_penalty
+                continue
+            if not completion.strip():
+                # Override disabled: fall through and keep the reward model's raw (possibly
+                # unreliable) score, matching pre-fix behavior exactly for ablation purposes.
+                continue
+
+            if args.repetition_penalty_weight > 0:
+                rep_frac = _repeated_trigram_fraction(completion)
+                scores[i] -= args.repetition_penalty_weight * rep_frac
+
+            if args.clipped_completion_penalty > 0:
+                # Approximate "hit max_new_tokens without an EOS" via retokenized length,
+                # since reward_fn only receives completion text, not the original token ids
+                # / finish reason. An exact match isn't essential here — this is a nudge,
+                # not a hard constraint.
+                token_len = len(tokenizer(completion, add_special_tokens=False)["input_ids"])
+                if token_len >= args.max_new_tokens:
+                    scores[i] -= args.clipped_completion_penalty
+
         return scores
 
     # ---- Dataset ----
@@ -523,6 +653,14 @@ def main():
         save_best_min_interval=args.save_best_min_interval,
     )
 
+    callbacks = [best_reward_cb]
+    if args.log_completions:
+        pruner_cb = CompletionsPruner(
+            completions_dir=scratch_root / "completions",
+            keep_last_n=args.completions_keep_last_n,
+        )
+        callbacks.append(pruner_cb)
+
     trainer_cls = GRPOTrainer if args.kl_guard_disable else GuardedGRPOTrainer
     trainer_kwargs = dict(
         model=model,
@@ -530,7 +668,7 @@ def main():
         train_dataset=train_dataset,
         reward_funcs=reward_fn,
         processing_class=tokenizer,
-        callbacks=[best_reward_cb],
+        callbacks=callbacks,
     )
     if trainer_cls is GuardedGRPOTrainer:
         trainer_kwargs["kl_explosion_floor"] = args.kl_guard_floor
@@ -549,8 +687,12 @@ def main():
     print("max_grad_norm       :", args.max_grad_norm)
     print("reward_clip         :", args.reward_clip if args.reward_clip > 0 else "disabled")
     print("log_completions     :", args.log_completions,
-          f"(console printing {'on' if args.print_completions_console else 'off — W&B table only'})"
+          f"(console printing {'on' if args.print_completions_console else 'off — W&B table only'}"
+          f", keep last {args.completions_keep_last_n} local files)"
           if args.log_completions else "")
+    print("empty_completion_penalty  :", "disabled (raw reward model score used)" if args.disable_empty_completion_penalty else args.empty_completion_penalty)
+    print("repetition_penalty_weight :", args.repetition_penalty_weight if args.repetition_penalty_weight > 0 else "disabled")
+    print("clipped_completion_penalty:", args.clipped_completion_penalty if args.clipped_completion_penalty > 0 else "disabled")
     print("save_best_min_interval:", args.save_best_min_interval)
     if args.kl_guard_disable:
         print("kl_guard            : disabled")

@@ -184,9 +184,97 @@ completion samples from this run before shipping:
 All new flags default to the recommended values; no extra flags are required to get these fixes
 on the next run.
 
+**Update:** these three fixes were later suspected of causing a training-quality regression in
+the next run — see Section 5 for the full investigation and its resolution. Short version: they
+didn't. Keep them; the empty-completion override is worth revisiting for a different reason
+(mechanism, not outcome) — also covered in Section 6.
+
 ---
 
-## 5. Key metrics to monitor (reference)
+## 5. The v3 "regression" investigation — and why it wasn't one
+
+After the fixes in Section 4 shipped, the next run (**v3**) showed a flat, non-improving reward
+trend where the original run (**v2**) had shown steady improvement. This section documents the
+investigation into why, and its eventual resolution — which turned out to be a measurement
+artifact, not a real regression.
+
+### The apparent problem
+- v3's smoothed `train/reward` curve stayed flat around -0.22 to -0.25 across 10,000 steps, where
+  v2's had climbed from about -0.25 to -0.09 over the same range.
+- v3 also showed more severe (though not more frequent) KL-guard explosions early on: 4 events
+  above 500K raw_kl in its first 1,245 steps, including two above 5M, versus v2's roughly one
+  severe outlier across its entire run.
+
+### Ruling out hypotheses, one at a time
+1. **Beta.** Ruled out immediately — identical (`0.05`) across every run compared.
+2. **The three new reward-shaping penalties** (repetition, clipped-completion, empty-completion).
+   Tested via an ablation run (**v4**, ` --repetition_penalty_weight 0 --clipped_completion_penalty 0`,
+   empty-completion penalty still active) — still plateaued, statistically indistinguishable from
+   v3 at matched steps. Partial evidence against the penalties, but incomplete: the
+   empty-completion override couldn't be disabled by a flag yet, so it remained a live variable.
+3. **KL-explosion severity.** Checked directly via exported `kl_guard/raw_kl` data for the
+   ablation run: only 1 severe event (>500K) across 3,089 steps — calm, like v2, not like v3.
+   Ruled out as the differentiator, since a "calm" run still plateaued.
+4. **The empty-completion override specifically.** Re-examined more carefully: it isn't just a
+   scoring correction — it participates in the **group-relative advantage calculation**. Forcing
+   one group member's reward to a fixed value shifts that group's mean/std, and therefore the
+   advantage (and gradient) for every *other* completion in the same group. Added
+   `--disable_empty_completion_penalty` to allow a true ablation of this specific mechanism.
+5. **Full ablation (v5)**: all three penalties disabled/bypassed, otherwise identical to v3/v4.
+   v5's smoothed training curve visually tracked v2's closely across all 10,000 steps, and its
+   `best_reward` kept improving throughout the run (reaching 0.289, versus v3's stalled 0.193 and
+   v4's stalled 0.218) — strong circumstantial evidence the empty-completion override had been
+   the cause.
+
+### The confound that undid all of the above
+Every completions comparison for v2 (the step 335/2353/5402/10000 samples in Section 3) used
+whatever prompts happened to appear in that step's live training batch — different prompts each
+time. Every comparison for v3/v4/v5 used a new tool, **`eval_checkpoint.py`**, built specifically
+to eliminate that confound: a fixed, hardcoded set of 8 prompts, generated and scored identically
+regardless of checkpoint. This made v3/v4/v5 directly comparable *to each other* — but **v2 was
+never once evaluated with this tool**. Every "v5 vs v2" comparison up to this point was actually
+comparing two different measurement methods on two different prompt sets — precisely the
+confound `eval_checkpoint.py` existed to remove, reintroduced by omission.
+
+### Resolution
+v2's final checkpoint (uploaded to `tsaxena/gpt2-large-grpo-prompt-writing`) was evaluated with
+`eval_checkpoint.py` on the same fixed 8 prompts used throughout:
+
+| checkpoint | mean reward (fixed 8-prompt eval) |
+|---|---|
+| **v2 final (true baseline, evaluated properly for the first time)** | **-0.206** |
+| v3 @ step 1898 | -0.174 |
+| v3 @ step 6000 | -0.170 |
+| v4 (ablation) @ step 4000 | -0.183 |
+| v5 (full ablation) @ step 7177 | -0.164 |
+
+**v2's real score on this prompt set is statistically indistinguishable from v3, v4, and v5** —
+all five numbers fall within noise of each other (std ~0.31-0.40 on n=64 each), and v5 is
+actually marginally *better* than v2's own baseline. **There was no real performance gap to
+explain.** v2's apparent climb to -0.09 was real for the specific prompts in its own live
+training batches, but never generalized to this fixed prompt set — the entire multi-run
+investigation was chasing a difference that was an artifact of inconsistent measurement
+methodology, not a property of any training run.
+
+### What still stands, and what to take from this
+- The three reward-shaping penalties (Section 4) are **cleared** — no evidence they hurt training
+  quality. Keep them.
+- The empty-completion override's *mechanism* (distorting group-relative advantage for other
+  completions in the group) is still real and still worth fixing on principle, even though it
+  turned out not to be causing the effect it was blamed for. A better version: substitute the
+  group's own median reward for empty completions rather than injecting an extreme forced value,
+  so degenerate outputs are still discouraged without skewing their neighbors' advantage signal.
+  (Not yet implemented.)
+- **Lesson for future comparisons:** pin down identical measurement methodology *before* comparing
+  runs, with the same rigor applied to the training config. A fixed-prompt eval tool
+  (`eval_checkpoint.py`) is only a valid comparison baseline if every run being compared —
+  including the original "reference" run — is evaluated with it. Retrofitting it onto new runs
+  while leaving the baseline measured a different way silently reintroduces the exact confound
+  the tool was built to eliminate.
+
+---
+
+## 6. Key metrics to monitor (reference)
 
 | Category | Metrics | What to watch |
 |---|---|---|
