@@ -1,11 +1,14 @@
 """
 Davidsonian Scene Graph (DSG) - Text-to-Image Fidelity Evaluation
++ HPSv2 (Human Preference Score v2) - Aesthetic/Preference Evaluation
 Based on: https://github.com/j-min/DSG  (ICLR 2024)
+          https://github.com/tgxs002/HPSv2
 
 Models:
   Image : runwayml/stable-diffusion-v1-5 (local, via diffusers)
   LLM   : any text model  (default: google/gemma-3-27b-it, via OpenRouter)
   VQA   : qwen/qwen3-vl-32b-instruct  (via OpenRouter)
+  HPS   : hpsv2 package (local, CLIP-based preference model checkpoint auto-downloaded on first use)
 
 Pipeline:
   0. Stable Diffusion generates an image from the prompt (if --image not given)
@@ -15,16 +18,24 @@ Pipeline:
   4. Qwen VL answers each question given the generated image
   5. Dependency-aware scoring: skip child questions if parent fails
   6. Report stated_fidelity / implied_coherence / invented_rate + overall DSG score
+  7. HPSv2 scores the same image against the prompt (independent of steps 1-6)
 
 Hallucination classification:
   stated   - explicitly in the prompt          → must be present (penalise if missing)
   implied  - strongly implied by the prompt    → desirable if present
   invented - not stated or implied             → undesirable if present (penalised)
 
+HPSv2 note: the score is a CLIP-based preference prediction. It is most meaningful when
+comparing multiple images generated for the SAME prompt (that's what the model was trained
+for); across different prompts, some prompts are just easier to score well on regardless of
+image quality, so treat cross-prompt HPS comparisons with a bit of caution — DSG's
+per-prompt fidelity/coherence breakdown is the more apples-to-apples signal for that.
+
 Usage:
     export OPENROUTER_API_KEY=sk-or-...
+    pip install hpsv2   # first run auto-downloads the HPS v2/v2.1 checkpoint
 
-    # Generate image from prompt, then evaluate
+    # Generate image from prompt, then evaluate (DSG + HPS, both on by default)
     python dsg.py --prompt "a red car next to a blue bicycle"
 
     # Use an existing image
@@ -38,13 +49,26 @@ Usage:
         --sd-model "runwayml/stable-diffusion-v1-5" \\
         --device cuda \\
         --llm-model "anthropic/claude-3.5-haiku" \\
-        --vqa-model "qwen/qwen3-vl-32b-instruct"
+        --vqa-model "qwen/qwen3-vl-32b-instruct" \\
+        --hps-version v2.1
 
     # Enrich prompt before image generation (base / dpo / ppo)
     python dsg.py --prompt "a red car next to a blue bicycle" \\
         --enrich-method ppo \\
         --enrich-device cpu \\
         --enrich-max-tokens 80
+
+    # Only run one of the two scores
+    python dsg.py --prompt "..." --skip-hps   # DSG only
+    python dsg.py --prompt "..." --skip-dsg   # HPS only (no OPENROUTER_API_KEY needed)
+
+    # Evaluate a trained checkpoint over the SAME fixed prompt set used by eval_checkpoint.py
+    # (directly comparable to those reward-model eval numbers). Generates --num-samples
+    # completions per prompt, builds "<prompt><completion>" as the final image prompt, then
+    # runs DSG+HPS on each. Results APPEND to --output across runs, so evaluating multiple
+    # checkpoints over time builds one comparable table (same idea as eval_checkpoint.py).
+    python dsg.py --checkpoint-path /path/to/checkpoint --step-label v7_step_7177 \\
+        --num-samples 2 --output dsg_hps_results.json
 """
 
 import argparse
@@ -56,6 +80,53 @@ import sys
 from pathlib import Path
 
 from openai import OpenAI
+
+# ---------------------------------------------------------------------------
+# Workaround for a diffusers/torch incompatibility (not a dsg.py bug):
+# diffusers' attention_dispatch.py gates a flash-attention-3 custom op registration
+# behind `if torch.__version__ >= "2.4.0"`, assuming any torch >= 2.4.0 fully supports
+# it. In practice, some torch 2.4.x builds have torch.library.custom_op available but
+# their infer_schema() can't parse this specific op's type hints, causing
+# `from diffusers import StableDiffusionPipeline` to fail at import time — even though
+# nothing in this project ever touches flash-attention-3 or the models that use it.
+#
+# IMPORTANT: this must be SELECTIVE by op name, not a blanket replacement of
+# torch.library.custom_op/register_fake. A blanket patch was tried first and broke a
+# completely different, unrelated thing: diffusers' own import chain transitively
+# imports torch._dynamo / torch.distributed.tensor, which ALSO call custom_op/
+# register_fake internally and depend on the real implementation's return value
+# (a proper CustomOpDef with a .register_fake attribute, which a naive no-op stub
+# doesn't provide) — a blanket patch broke those with an unrelated AttributeError.
+# This version only intercepts the exact two ops that are actually broken, and
+# passes every other call straight through to the real implementation.
+try:
+    import torch.library as _torch_library
+
+    _real_custom_op = _torch_library.custom_op
+    _real_register_fake = _torch_library.register_fake
+    _DSG_PROBLEM_OPS = {
+        "_diffusers_flash_attn_3::_flash_attn_forward",
+        "_diffusers_flash_attn_3::_flash_attn_backward",
+    }
+
+    def _dsg_selective_custom_op(name, fn=None, /, *, mutates_args=None, device_types=None, schema=None):
+        if name in _DSG_PROBLEM_OPS:
+            def _wrap(func):
+                return func
+            return _wrap if fn is None else fn
+        return _real_custom_op(name, fn, mutates_args=mutates_args, device_types=device_types, schema=schema)
+
+    def _dsg_selective_register_fake(op, fn=None, /, *, lib=None, _stacklevel=1):
+        if isinstance(op, str) and op in _DSG_PROBLEM_OPS:
+            def _wrap(func):
+                return func
+            return _wrap if fn is None else fn
+        return _real_register_fake(op, fn, lib=lib, _stacklevel=_stacklevel)
+
+    _torch_library.custom_op = _dsg_selective_custom_op
+    _torch_library.register_fake = _dsg_selective_register_fake
+except ImportError:
+    pass  # torch not installed — nothing to patch
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -113,6 +184,20 @@ def generate_sd_image(prompt: str, save_path: str,
 BASE_ENRICH_MODEL = "tsaxena/gpt2-large-prompt-tags"
 PPO_ENRICH_MODEL  = "tsaxena/gpt2-large-ppo-prompt-tags"
 DPO_ENRICH_MODEL  = "tsaxena/gpt2-large-dpo-corrected"
+
+# Identical to TEST_PROMPTS in eval_checkpoint.py — deliberately, so DSG/HPS results from
+# --checkpoint-path runs are directly comparable to that script's reward-model eval numbers
+# on the exact same prompts, no confound.
+TEST_PROMPTS = [
+    "a movie monster from 80s",
+    "maps of boston and seattle",
+    "a 2d art background from gta videogame",
+    "a skyline of Lyon in summer at 8 am",
+    "a sniper taking aim",
+    "a 3d colorful cat",
+    "a hooded guy with a gas mask holding a vape",
+    "a young blonde girl",
+]
 
 _enrich_cache: dict = {}  # {model_path: (model, tokenizer)} — loaded once per process
 
@@ -191,6 +276,92 @@ def enrich_prompt(prompt: str, method: str = "ppo", device: str = "cpu",
     print(f"[Enrich/{method.upper()}] Original : {prompt!r}")
     print(f"[Enrich/{method.upper()}] Enriched : {enriched!r}")
     return enriched
+
+# ---------------------------------------------------------------------------
+# Generate completions from an arbitrary checkpoint (mirrors eval_checkpoint.py)
+# ---------------------------------------------------------------------------
+
+def generate_completions_from_checkpoint(checkpoint_path: str, prompts: list[str],
+                                         num_samples: int = 2, max_new_tokens: int = 80,
+                                         temperature: float = 1.0, device: str = "cuda") -> list[dict]:
+    """Generate `num_samples` completions per prompt from a GRPO/PPO/DPO-style checkpoint.
+
+    Same generation settings and prompt formatting as eval_checkpoint.py (prompt + "</s>",
+    left-padded batched sampling), so completions here are produced the same way as the
+    reward-model eval — the only difference is what happens to them afterward (DSG/HPS on a
+    rendered image here, vs. a text reward model there).
+
+    Returns a flat list of {"prompt": str, "completion": str} dicts, length
+    len(prompts) * num_samples.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    print(f"[Checkpoint] Loading {checkpoint_path} …")
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # required for correct batched generation with a causal LM
+
+    model_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else None
+    model = AutoModelForCausalLM.from_pretrained(checkpoint_path, torch_dtype=model_dtype).to(device)
+    model.eval()
+
+    rows = []
+    for prompt in prompts:
+        prompt_text = prompt + "</s>"
+        inputs = tokenizer([prompt_text] * num_samples, return_tensors="pt", padding=True).to(device)
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=1.0,
+                top_k=0,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        prompt_len = inputs["input_ids"].shape[1]  # same for every row: left-padded to equal length
+        completions = [
+            tokenizer.decode(out[prompt_len:], skip_special_tokens=True) for out in output_ids
+        ]
+        for completion in completions:
+            rows.append({"prompt": prompt, "completion": completion})
+        print(f"  [{prompt[:40]:40s}] generated {len(completions)} completion(s)")
+
+    return rows
+
+# ---------------------------------------------------------------------------
+# HPSv2 (Human Preference Score v2) scoring
+# ---------------------------------------------------------------------------
+
+DEFAULT_HPS_VERSION = "v2.1"
+
+_hpsv2_module = None  # cached import — the package lazily loads its CLIP checkpoint on first score() call
+
+
+def compute_hps_score(image_path: str, prompt: str, hps_version: str = DEFAULT_HPS_VERSION) -> float:
+    """Score a single (image, prompt) pair with HPSv2.
+
+    hpsv2.score() always returns a list (confirmed from the installed package's source —
+    even for a single string image path), so we always take element [0] here rather than
+    branching on the return type.
+
+    Note: v2.0 and v2.1 scores are NOT comparable to each other (different checkpoints,
+    different scales) — keep hps_version consistent across everything you intend to compare.
+    """
+    global _hpsv2_module
+    if _hpsv2_module is None:
+        try:
+            import hpsv2
+        except ImportError:
+            sys.exit("Error: hpsv2 is required for HPS scoring.\n"
+                     "Install with: pip install hpsv2\n"
+                     "(Use --skip-hps to run DSG only without this dependency.)")
+        _hpsv2_module = hpsv2
+
+    result = _hpsv2_module.score(image_path, prompt, hps_version=hps_version)
+    return float(result[0])
 
 # ---------------------------------------------------------------------------
 # LLM prompts (adapted from DSG paper / repo)
@@ -346,32 +517,57 @@ def extract_json(text: str):
                 continue
     return json.loads(text)  # final attempt — will raise if broken
 
+
+def call_llm_json(client: OpenAI, system: str, user: str, model: str, max_retries: int = 3):
+    """call_llm + extract_json, retrying on malformed JSON.
+
+    A single bad JSON response from the LLM (truncated output, a stray comment, an unescaped
+    quote) doesn't mean the model can't do the task — resampling usually produces valid JSON on
+    the next attempt. Retrying the LLM CALL (not just re-parsing the same broken text) is what
+    actually recovers from this. Only raises after every attempt has failed, and when it does,
+    includes the raw response text so the failure is debuggable from the error message alone —
+    "Expecting ':' delimiter at char 1107" tells you nothing about what the model actually said.
+    """
+    last_error = None
+    last_raw = None
+    for attempt in range(1, max_retries + 1):
+        raw = call_llm(client, system, user, model)
+        last_raw = raw
+        try:
+            return extract_json(raw)
+        except json.JSONDecodeError as e:
+            last_error = e
+            print(f"  [warn] malformed JSON from {model} (attempt {attempt}/{max_retries}): {e}")
+            continue
+    raise RuntimeError(
+        f"LLM ({model}) failed to produce valid JSON after {max_retries} attempts.\n"
+        f"Last parse error: {last_error}\n"
+        f"Last raw response:\n{last_raw}"
+    )
+
 # ---------------------------------------------------------------------------
 # DSG pipeline steps
 # ---------------------------------------------------------------------------
 
 def generate_tuples(client: OpenAI, prompt: str, model: str) -> list[dict]:
-    raw = call_llm(client,
-                   "You are a semantic scene decomposition assistant. Respond only with JSON.",
-                   PROMPT_TUPLE.format(prompt=prompt),
-                   model)
-    return extract_json(raw)
+    return call_llm_json(client,
+                         "You are a semantic scene decomposition assistant. Respond only with JSON.",
+                         PROMPT_TUPLE.format(prompt=prompt),
+                         model)
 
 
 def generate_dependencies(client: OpenAI, prompt: str, tuples: list[dict], model: str) -> dict:
-    raw = call_llm(client,
-                   "You are a dependency analysis assistant. Respond only with JSON.",
-                   PROMPT_DEPENDENCY.format(prompt=prompt, tuples=json.dumps(tuples, indent=2)),
-                   model)
-    return extract_json(raw)
+    return call_llm_json(client,
+                         "You are a dependency analysis assistant. Respond only with JSON.",
+                         PROMPT_DEPENDENCY.format(prompt=prompt, tuples=json.dumps(tuples, indent=2)),
+                         model)
 
 
 def generate_questions(client: OpenAI, prompt: str, tuples: list[dict], model: str) -> dict:
-    raw = call_llm(client,
-                   "You are a visual question generation assistant. Respond only with JSON.",
-                   PROMPT_QUESTION.format(prompt=prompt, tuples=json.dumps(tuples, indent=2)),
-                   model)
-    return extract_json(raw)
+    return call_llm_json(client,
+                         "You are a visual question generation assistant. Respond only with JSON.",
+                         PROMPT_QUESTION.format(prompt=prompt, tuples=json.dumps(tuples, indent=2)),
+                         model)
 
 
 def run_vqa(client: OpenAI, questions: dict, data_url: str, vqa_model: str) -> dict:
@@ -489,54 +685,68 @@ def dependency_aware_score(tuples: list[dict], dependencies: dict,
 # ---------------------------------------------------------------------------
 
 def evaluate(prompt: str, image_path: str, client: OpenAI,
-             llm_model: str, vqa_model: str, verbose: bool = True) -> dict:
+             llm_model: str, vqa_model: str,
+             run_dsg: bool = True, run_hps: bool = True,
+             hps_version: str = DEFAULT_HPS_VERSION,
+             verbose: bool = True) -> dict:
     print(f"\n{'='*60}")
     print(f"Prompt    : {prompt}")
     print(f"Image     : {image_path}")
-    print(f"LLM model : {llm_model}")
-    print(f"VQA model : {vqa_model}")
+    if run_dsg:
+        print(f"LLM model : {llm_model}")
+        print(f"VQA model : {vqa_model}")
+    if run_hps:
+        print(f"HPS ver.  : {hps_version}")
     print(f"{'='*60}")
 
-    print("\n[Step 1] Generating semantic tuples …")
-    tuples = generate_tuples(client, prompt, llm_model)
-    if verbose:
-        for t in tuples:
-            g = t.get('grounding', 'stated')
-            print(f"  {t['id']} ({t['skill']}, {g}): {t['args']}")
+    result = {"prompt": prompt, "image_path": image_path}
 
-    print("\n[Step 2] Inferring dependency graph …")
-    dependencies = generate_dependencies(client, prompt, tuples, llm_model)
-    if verbose:
-        print(f"  {dependencies}")
+    if run_dsg:
+        print("\n[Step 1] Generating semantic tuples …")
+        tuples = generate_tuples(client, prompt, llm_model)
+        if verbose:
+            for t in tuples:
+                g = t.get('grounding', 'stated')
+                print(f"  {t['id']} ({t['skill']}, {g}): {t['args']}")
 
-    print("\n[Step 3] Generating yes/no questions …")
-    questions = generate_questions(client, prompt, tuples, llm_model)
-    if verbose:
-        for qid, q in questions.items():
-            print(f"  {qid}: {q}")
+        print("\n[Step 2] Inferring dependency graph …")
+        dependencies = generate_dependencies(client, prompt, tuples, llm_model)
+        if verbose:
+            print(f"  {dependencies}")
 
-    print("\n[Step 4] Loading image …")
-    data_url, _ = image_to_data_url(image_path)
+        print("\n[Step 3] Generating yes/no questions …")
+        questions = generate_questions(client, prompt, tuples, llm_model)
+        if verbose:
+            for qid, q in questions.items():
+                print(f"  {qid}: {q}")
 
-    print("\n[Step 5] Running VQA …")
-    answers = run_vqa(client, questions, data_url, vqa_model)
+        print("\n[Step 4] Loading image …")
+        data_url, _ = image_to_data_url(image_path)
 
-    print("\n[Step 6] Computing DSG score (dependency-aware) …")
-    result = dependency_aware_score(tuples, dependencies, questions, answers)
-    result["prompt"]     = prompt
-    result["image_path"] = image_path
-    result["llm_model"]  = llm_model
-    result["vqa_model"]  = vqa_model
+        print("\n[Step 5] Running VQA …")
+        answers = run_vqa(client, questions, data_url, vqa_model)
 
-    print(f"\n  ✓ Overall DSG score   : {result['overall_dsg_score']:.2%}")
-    print(f"  ✓ Stated fidelity     : {result['stated_fidelity']:.2%}"   if result['stated_fidelity']   is not None else "  - Stated fidelity     : n/a")
-    print(f"  ✓ Implied coherence   : {result['implied_coherence']:.2%}" if result['implied_coherence'] is not None else "  - Implied coherence   : n/a")
-    print(f"  ✓ Invented rate       : {result['invented_rate']:.2%}"     if result['invented_rate']     is not None else "  - Invented rate       : n/a")
-    if result["entity_confusion"]:
-        print(f"  ✗ Entity confusion    : {len(result['entity_confusion'])} failure(s)")
-        for q in result["entity_confusion"]:
-            print(f"      - {q}")
-    print(f"  ✓ Per-skill           : {result['per_skill_accuracy']}")
+        print("\n[Step 6] Computing DSG score (dependency-aware) …")
+        dsg_result = dependency_aware_score(tuples, dependencies, questions, answers)
+        result.update(dsg_result)
+        result["llm_model"] = llm_model
+        result["vqa_model"] = vqa_model
+
+        print(f"\n  ✓ Overall DSG score   : {result['overall_dsg_score']:.2%}")
+        print(f"  ✓ Stated fidelity     : {result['stated_fidelity']:.2%}"   if result['stated_fidelity']   is not None else "  - Stated fidelity     : n/a")
+        print(f"  ✓ Implied coherence   : {result['implied_coherence']:.2%}" if result['implied_coherence'] is not None else "  - Implied coherence   : n/a")
+        print(f"  ✓ Invented rate       : {result['invented_rate']:.2%}"     if result['invented_rate']     is not None else "  - Invented rate       : n/a")
+        if result["entity_confusion"]:
+            print(f"  ✗ Entity confusion    : {len(result['entity_confusion'])} failure(s)")
+            for q in result["entity_confusion"]:
+                print(f"      - {q}")
+        print(f"  ✓ Per-skill           : {result['per_skill_accuracy']}")
+
+    if run_hps:
+        print("\n[Step 7] Computing HPSv2 score …")
+        result["hps_score"] = compute_hps_score(image_path, prompt, hps_version)
+        result["hps_version"] = hps_version
+        print(f"  ✓ HPSv2 score ({hps_version}) : {result['hps_score']:.4f}")
 
     return result
 
@@ -549,6 +759,10 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--prompt", help="Single text prompt")
     group.add_argument("--csv",    help="CSV file with columns: prompt, image_path")
+    group.add_argument("--checkpoint-path",
+                       help="Generate completions from this checkpoint over the fixed "
+                            "TEST_PROMPTS set (same prompts as eval_checkpoint.py) and "
+                            "evaluate each. Final image prompt = '<prompt><completion>'.")
 
     parser.add_argument("--image",     help="Path to image; if omitted (or blank in CSV), "
                                             "an image is generated via Stable Diffusion")
@@ -560,6 +774,30 @@ def main():
     parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL,    help="OpenRouter model for LLM steps")
     parser.add_argument("--vqa-model", default=DEFAULT_VQA_MODEL,    help="OpenRouter model for VQA step")
     parser.add_argument("--api-key",   default=os.environ.get("OPENROUTER_API_KEY"), help="OpenRouter API key")
+    parser.add_argument("--hps-version", default=DEFAULT_HPS_VERSION, choices=["v2.0", "v2.1"],
+                                         help="HPSv2 checkpoint version (default: v2.1). "
+                                              "Scores from different versions are not comparable "
+                                              "to each other — keep this consistent across a comparison.")
+    parser.add_argument("--skip-dsg",  action="store_true",
+                                       help="Skip DSG scoring (HPS only — no OPENROUTER_API_KEY needed)")
+    parser.add_argument("--skip-hps",  action="store_true",
+                                       help="Skip HPSv2 scoring (DSG only — no hpsv2 package needed)")
+
+    ckpt_group = parser.add_argument_group("checkpoint evaluation (--checkpoint-path)")
+    ckpt_group.add_argument("--step-label", default=None,
+                            help="Label recorded in each result (e.g. the training step this "
+                                 "checkpoint corresponds to). Defaults to the checkpoint dir/repo name.")
+    ckpt_group.add_argument("--num-samples", type=int, default=2,
+                            help="Completions sampled per prompt (default: 2 — each sample costs "
+                                 "one full SD image + several LLM/VQA calls + one HPS score, so "
+                                 "this is kept low by default; raise it if you want a more stable "
+                                 "per-prompt average at proportionally higher cost).")
+    ckpt_group.add_argument("--gen-max-new-tokens", type=int, default=80,
+                            help="Max new tokens when generating completions from --checkpoint-path")
+    ckpt_group.add_argument("--gen-temperature", type=float, default=1.0,
+                            help="Sampling temperature when generating completions from --checkpoint-path")
+    ckpt_group.add_argument("--gen-device", default="cuda",
+                            help="Device for the checkpoint's generation model")
 
     enrich_group = parser.add_argument_group("prompt enrichment")
     enrich_group.add_argument(
@@ -576,10 +814,17 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.api_key:
-        sys.exit("Error: set OPENROUTER_API_KEY env var or pass --api-key")
+    if args.skip_dsg and args.skip_hps:
+        sys.exit("Error: --skip-dsg and --skip-hps both set — nothing to compute.")
 
-    client = make_client(args.api_key)
+    run_dsg = not args.skip_dsg
+    run_hps = not args.skip_hps
+
+    if run_dsg and not args.api_key:
+        sys.exit("Error: DSG scoring needs an OpenRouter key — set OPENROUTER_API_KEY env var, "
+                 "pass --api-key, or use --skip-dsg to run HPS only.")
+
+    client = make_client(args.api_key) if run_dsg else None
 
     def resolve_image(prompt: str, image_path: str, index: int = 0) -> str:
         """Return image_path, generating the image first if the file doesn't exist."""
@@ -599,10 +844,11 @@ def main():
     if args.prompt:
         gen_prompt = maybe_enrich(args.prompt)
         image_path = resolve_image(gen_prompt, args.image, index=0)
-        res = evaluate(args.prompt, image_path, client, args.llm_model, args.vqa_model)
+        res = evaluate(args.prompt, image_path, client, args.llm_model, args.vqa_model,
+                       run_dsg=run_dsg, run_hps=run_hps, hps_version=args.hps_version)
         res["enriched_prompt"] = gen_prompt
         results = [res]
-    else:
+    elif args.csv:
         import csv
         results = []
         with open(args.csv, newline="") as f:
@@ -610,24 +856,123 @@ def main():
                 prompt     = row["prompt"].strip()
                 gen_prompt = maybe_enrich(prompt)
                 image_path = resolve_image(gen_prompt, row.get("image_path", "").strip(), index=i)
-                res = evaluate(prompt, image_path, client, args.llm_model, args.vqa_model)
-                res["enriched_prompt"] = gen_prompt
+                try:
+                    res = evaluate(prompt, image_path, client, args.llm_model, args.vqa_model,
+                                   run_dsg=run_dsg, run_hps=run_hps, hps_version=args.hps_version)
+                    res["enriched_prompt"] = gen_prompt
+                except Exception as e:
+                    # One bad LLM/API response shouldn't lose every other already-computed
+                    # result in the batch — record the failure and keep going.
+                    print(f"  [ERROR] row {i} ({prompt[:50]!r}) failed, skipping: {e}")
+                    res = {"prompt": prompt, "image_path": image_path,
+                          "enriched_prompt": gen_prompt, "error": str(e)}
                 results.append(res)
+    else:
+        # --checkpoint-path: generate completions over the fixed TEST_PROMPTS set, evaluate each.
+        step_label = args.step_label or Path(args.checkpoint_path).name
+        print(f"[Checkpoint] step_label = {step_label!r}")
+
+        completions = generate_completions_from_checkpoint(
+            args.checkpoint_path, TEST_PROMPTS,
+            num_samples=args.num_samples,
+            max_new_tokens=args.gen_max_new_tokens,
+            temperature=args.gen_temperature,
+            device=args.gen_device,
+        )
+
+        results = []
+        for i, row in enumerate(completions):
+            # Plain concatenation, matching the reward-model scoring convention used
+            # throughout this project (prompt + completion — completions already carry
+            # whatever leading punctuation/spacing they were trained to produce).
+            final_prompt = row["prompt"] + row["completion"]
+            # Unique filename per (step_label, index) so images from different checkpoint
+            # runs don't silently overwrite each other on disk (default naming otherwise
+            # collides: dsg_generated_0.png, dsg_generated_1.png, ... every run).
+            image_path = resolve_image(final_prompt, f"dsg_generated_{step_label}_{i}.png", index=i)
+            try:
+                res = evaluate(final_prompt, image_path, client, args.llm_model, args.vqa_model,
+                               run_dsg=run_dsg, run_hps=run_hps, hps_version=args.hps_version)
+            except Exception as e:
+                # Same reasoning as the CSV loop: a batch here can be dozens of items
+                # (len(TEST_PROMPTS) * num_samples) — one bad response must not cost every
+                # other already-computed result.
+                print(f"  [ERROR] item {i} ({row['prompt'][:50]!r}) failed, skipping: {e}")
+                res = {"prompt": final_prompt, "image_path": image_path, "error": str(e)}
+            res["checkpoint_path"]   = args.checkpoint_path
+            res["step_label"]        = step_label
+            res["original_prompt"]   = row["prompt"]
+            res["completion"]        = row["completion"]
+            results.append(res)
+
+    # Append rather than overwrite, so evaluating multiple checkpoints over time (via repeated
+    # --checkpoint-path runs with different --step-label values) builds one comparable table,
+    # the same idea as eval_checkpoint.py's eval_results.csv.
+    existing = []
+    if Path(args.output).exists():
+        try:
+            with open(args.output) as f:
+                existing = json.load(f)
+            if not isinstance(existing, list):
+                existing = []
+        except (json.JSONDecodeError, OSError):
+            existing = []
+    all_results = existing + results
 
     with open(args.output, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\n✓ Results saved to {args.output}")
+        json.dump(all_results, f, indent=2)
+    print(f"\n✓ {len(results)} new result(s) appended to {args.output} ({len(all_results)} total)")
+
+    ok_results = [r for r in results if "error" not in r]
+    failed_results = [r for r in results if "error" in r]
 
     if len(results) > 1:
-        print(f"\n{'Prompt':<40} {'DSG':>7} {'Fidelity':>9} {'Coherence':>10} {'Invented':>9}")
-        print("-" * 78)
-        for r in results:
-            sf = f"{r['stated_fidelity']:.0%}"   if r['stated_fidelity']   is not None else "n/a"
-            ic = f"{r['implied_coherence']:.0%}" if r['implied_coherence'] is not None else "n/a"
-            iv = f"{r['invented_rate']:.0%}"     if r['invented_rate']     is not None else "n/a"
-            print(f"{r['prompt'][:38]:<40} {r['overall_dsg_score']:>7.0%} {sf:>9} {ic:>10} {iv:>9}")
-        avg = sum(r["overall_dsg_score"] for r in results) / len(results)
-        print(f"\n  Average DSG score: {avg:.2%}")
+        header = f"{'Prompt':<40}"
+        if run_dsg:
+            header += f" {'DSG':>7} {'Fidelity':>9} {'Coherence':>10} {'Invented':>9}"
+        if run_hps:
+            header += f" {'HPS':>8}"
+        print(f"\n{header}")
+        print("-" * len(header))
+        for r in ok_results:
+            line = f"{r['prompt'][:38]:<40}"
+            if run_dsg:
+                sf = f"{r['stated_fidelity']:.0%}"   if r['stated_fidelity']   is not None else "n/a"
+                ic = f"{r['implied_coherence']:.0%}" if r['implied_coherence'] is not None else "n/a"
+                iv = f"{r['invented_rate']:.0%}"     if r['invented_rate']     is not None else "n/a"
+                line += f" {r['overall_dsg_score']:>7.0%} {sf:>9} {ic:>10} {iv:>9}"
+            if run_hps:
+                line += f" {r['hps_score']:>8.4f}"
+            print(line)
+        for r in failed_results:
+            print(f"{r['prompt'][:38]:<40} FAILED — {r['error'][:60]}")
+
+        if failed_results:
+            print(f"\n  ⚠ {len(failed_results)}/{len(results)} item(s) failed and are excluded "
+                 f"from the averages below (see 'error' field in {args.output} for details)")
+        if run_dsg and ok_results:
+            avg_dsg = sum(r["overall_dsg_score"] for r in ok_results) / len(ok_results)
+            print(f"\n  Average DSG score: {avg_dsg:.2%}  (n={len(ok_results)})")
+        if run_hps and ok_results:
+            avg_hps = sum(r["hps_score"] for r in ok_results) / len(ok_results)
+            print(f"  Average HPS score ({args.hps_version}): {avg_hps:.4f}  (n={len(ok_results)})")
+
+    # Cross-checkpoint trend, if --output now contains more than one distinct step_label
+    # (i.e. this or a previous run used --checkpoint-path).
+    labeled = [r for r in all_results if r.get("step_label")]
+    step_labels = sorted(set(r["step_label"] for r in labeled))
+    if len(step_labels) > 1:
+        print(f"\n=== Trend across all checkpoints evaluated so far (same fixed prompts) ===")
+        for label in step_labels:
+            rows = [r for r in labeled if r["step_label"] == label]
+            rows_ok = [r for r in rows if "error" not in r]
+            n_failed = len(rows) - len(rows_ok)
+            line = f"  {label:<24} n={len(rows_ok):<4}" + (f" ({n_failed} failed)" if n_failed else "")
+            if run_dsg and rows_ok and all("overall_dsg_score" in r for r in rows_ok):
+                line += f" DSG={sum(r['overall_dsg_score'] for r in rows_ok) / len(rows_ok):.2%}"
+            if run_hps and rows_ok and all("hps_score" in r for r in rows_ok):
+                line += f" HPS={sum(r['hps_score'] for r in rows_ok) / len(rows_ok):.4f}"
+            print(line)
 
 
 if __name__ == "__main__":
