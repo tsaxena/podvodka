@@ -260,11 +260,9 @@ methodology, not a property of any training run.
 - The three reward-shaping penalties (Section 4) are **cleared** — no evidence they hurt training
   quality. Keep them.
 - The empty-completion override's *mechanism* (distorting group-relative advantage for other
-  completions in the group) is still real and still worth fixing on principle, even though it
-  turned out not to be causing the effect it was blamed for. A better version: substitute the
-  group's own median reward for empty completions rather than injecting an extreme forced value,
-  so degenerate outputs are still discouraged without skewing their neighbors' advantage signal.
-  (Not yet implemented.)
+  completions in the group) was still real and worth fixing on principle, even though it turned
+  out not to be causing the effect it was originally blamed for. See Section 6 — it was fixed,
+  and the fix turned out to help more than expected.
 - **Lesson for future comparisons:** pin down identical measurement methodology *before* comparing
   runs, with the same rigor applied to the training config. A fixed-prompt eval tool
   (`eval_checkpoint.py`) is only a valid comparison baseline if every run being compared —
@@ -274,7 +272,59 @@ methodology, not a property of any training run.
 
 ---
 
-## 6. Key metrics to monitor (reference)
+## 6. Fixing the empty-completion mechanism — a real improvement, found by accident
+
+With the plateau mystery resolved (Section 5), the empty-completion override's group-distortion
+side effect was revisited on its own merits — not because it was expected to move the needle, but
+because it was a known-real mechanism-level flaw worth fixing regardless.
+
+### The fix: group-median substitution
+New flag `--empty_completion_median`. Instead of forcing empty/whitespace-only completions to a
+fixed `--empty_completion_penalty` (default -1.0) — which injects an extreme value into the
+group's mean/std and therefore distorts the advantage of every *other* completion sharing that
+prompt — this substitutes the group's own median reward (computed from its non-empty members).
+Empty output is still discouraged relative to its peers, without poisoning their advantage signal.
+Falls back to the hard override only if an entire group is empty (no median available to take).
+
+Implemented as a standalone, unit-tested helper (`_substitute_empty_with_group_median`), verified
+against: a normal mixed group (empty correctly replaced with the median of its non-empty peers),
+a group with no empties (fully untouched), an all-empty group (correctly falls through to the
+hard-penalty fallback), and confirmed not to mutate its input list in place.
+
+### Result: a real, confirmed improvement — not just a neutral fix
+Evaluated with `eval_checkpoint.py` (same fixed 8-prompt set used throughout) at a step count
+(7,177) matched exactly against the best prior configuration:
+
+| configuration | step | `best_reward` | fixed-prompt eval (mean) |
+|---|---|---|---|
+| v2 (original, hard override, true baseline) | — | — | **-0.206** |
+| v5 (empty-completion protection disabled entirely) | 7,177 | 0.289 | -0.164 |
+| v6 (hard override off, rep+clip on) | 4,000 | 0.247* | **-0.159** |
+| **v7 (group-median substitution, rep+clip on)** | **7,177** | **0.302** | **-0.119** |
+
+\* v6's `best_reward` peak is not directly comparable to the others — see the note below on why
+`best_reward` misled the investigation mid-stream.
+
+**v7 is the best configuration found across the entire investigation on the one measurement
+method proven reliable in this project.** The median-substitution fix wasn't just safer than the
+hard override (as hoped) — it measurably improved policy quality, at the same step count as the
+next-best comparison (v5). Final recommended config going forward: `beta=0.05`,
+`--repetition_penalty_weight 0.15`, `--clipped_completion_penalty 0.1`,
+`--empty_completion_median` (in place of the old hard override).
+
+### A cautionary footnote on `best_reward`
+Mid-investigation, v6's `best_reward` appeared stuck at a low peak (0.247 at step 724, never
+improving afterward) while its fixed-prompt eval was actually the best result seen up to that
+point (-0.159). The explanation: `best_reward` tracks a *maximum* over noisy per-batch rewards,
+and repetition/clipped penalties fire somewhat randomly per-completion — a batch that happened to
+dodge them early can set a ceiling that's statistically hard for *any* later, larger, more
+representative batch to beat, independent of whether the underlying policy is actually improving.
+`best_reward` is a fragile signal under these penalties; the fixed-prompt eval mean (a stable
+64-sample average, immune to this ceiling effect) is the metric to trust when the two disagree.
+
+---
+
+## 7. Key metrics to monitor (reference)
 
 | Category | Metrics | What to watch |
 |---|---|---|
