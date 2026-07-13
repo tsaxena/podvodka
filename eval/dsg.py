@@ -62,17 +62,18 @@ Usage:
     python dsg.py --prompt "..." --skip-hps   # DSG only
     python dsg.py --prompt "..." --skip-dsg   # HPS only (no OPENROUTER_API_KEY needed)
 
-    # Evaluate a trained checkpoint over the SAME fixed prompt set used by eval_checkpoint.py
-    # (directly comparable to those reward-model eval numbers). Generates --num-samples
-    # completions per prompt, builds "<prompt><completion>" as the final image prompt, then
-    # runs DSG+HPS on each. Results APPEND to --output across runs, so evaluating multiple
-    # checkpoints over time builds one comparable table (same idea as eval_checkpoint.py).
+    # Evaluate a trained checkpoint over the 200 DrawBench prompts (shunk031/DrawBench).
+    # Generates --num-samples completions per prompt, builds "<prompt><completion>" as the
+    # final image prompt, then runs DSG+HPS on each. Results APPEND to --output across runs,
+    # so evaluating multiple checkpoints over time builds one comparable table.
     python dsg.py --checkpoint-path /path/to/checkpoint --step-label v7_step_7177 \\
         --num-samples 2 --output dsg_hps_results.json
 """
 
 import argparse
 import base64
+import hashlib
+import io
 import json
 import os
 import re
@@ -165,17 +166,39 @@ def _load_sd_pipeline(model_name: str, device: str):
     return _sd_pipe
 
 
-def generate_sd_image(prompt: str, save_path: str,
+def _image_cache_path(prompt: str, model_name: str, cache_dir: Path) -> Path:
+    key = hashlib.md5(f"{model_name}:{prompt}".encode()).hexdigest()
+    return cache_dir / f"{key}.png"
+
+
+def generate_sd_image(prompt: str,
                       model_name: str = DEFAULT_SD_MODEL,
-                      device: str = DEFAULT_DEVICE) -> str:
-    """Generate an image with Stable Diffusion and save it to save_path."""
+                      device: str = DEFAULT_DEVICE,
+                      cache_dir: Path | None = None):
+    """Generate an image with Stable Diffusion and return it as a PIL Image.
+
+    If cache_dir is given, the image is saved there on first generation and loaded
+    from disk on subsequent calls with the same prompt + model — skipping SD entirely.
+    Cache files are named by MD5(model:prompt) so they are stable across restarts.
+    """
+    from PIL import Image as PILImage
+
+    if cache_dir is not None:
+        cached = _image_cache_path(prompt, model_name, cache_dir)
+        if cached.exists():
+            print(f"[SD] Cache hit — loading {cached}")
+            return PILImage.open(cached).convert("RGB")
+
     pipe = _load_sd_pipeline(model_name, device)
     print(f"[SD] Generating: {prompt!r}")
     image = pipe(prompt).images[0]
-    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    image.save(save_path)
-    print(f"[SD] Saved to {save_path}")
-    return save_path
+
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        image.save(cached)
+        print(f"[SD] Cached to {cached}")
+
+    return image
 
 # ---------------------------------------------------------------------------
 # Prompt enrichment via local GPT-2 models (base / DPO / PPO)
@@ -185,19 +208,31 @@ BASE_ENRICH_MODEL = "tsaxena/gpt2-large-prompt-tags"
 PPO_ENRICH_MODEL  = "tsaxena/gpt2-large-ppo-prompt-tags"
 DPO_ENRICH_MODEL  = "tsaxena/gpt2-large-dpo-corrected"
 
-# Identical to TEST_PROMPTS in eval_checkpoint.py — deliberately, so DSG/HPS results from
-# --checkpoint-path runs are directly comparable to that script's reward-model eval numbers
-# on the exact same prompts, no confound.
-TEST_PROMPTS = [
-    "a movie monster from 80s",
-    "maps of boston and seattle",
-    "a 2d art background from gta videogame",
-    "a skyline of Lyon in summer at 8 am",
-    "a sniper taking aim",
-    "a 3d colorful cat",
-    "a hooded guy with a gas mask holding a vape",
-    "a young blonde girl",
-]
+def _load_drawbench_prompts() -> list[str]:
+    """Load all 200 DrawBench benchmark prompts (Saharia et al., Imagen 2022).
+
+    Dataset : shunk031/DrawBench on HuggingFace (11 categories, 200 prompts total).
+    Requires: pip install datasets
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        sys.exit("Error: the `datasets` package is required for --checkpoint-path evaluation.\n"
+                 "Install with: pip install datasets")
+    # datasets >= 3.0 removed support for dataset scripts entirely; trust_remote_code no
+    # longer helps. Try without it first — works when the dataset has Parquet snapshots.
+    try:
+        ds = load_dataset("shunk031/DrawBench", split="test")
+    except Exception:
+        try:
+            ds = load_dataset("shunk031/DrawBench", split="test", trust_remote_code=True)
+        except RuntimeError as e:
+            sys.exit(
+                f"Error loading DrawBench: {e}\n"
+                "The installed 'datasets' version no longer supports dataset scripts.\n"
+                "Fix: pip install 'datasets<3.0'"
+            )
+    return [row["prompts"] for row in ds]
 
 _enrich_cache: dict = {}  # {model_path: (model, tokenizer)} — loaded once per process
 
@@ -340,12 +375,12 @@ DEFAULT_HPS_VERSION = "v2.1"
 _hpsv2_module = None  # cached import — the package lazily loads its CLIP checkpoint on first score() call
 
 
-def compute_hps_score(image_path: str, prompt: str, hps_version: str = DEFAULT_HPS_VERSION) -> float:
-    """Score a single (image, prompt) pair with HPSv2.
+def compute_hps_score(image, prompt: str, hps_version: str = DEFAULT_HPS_VERSION) -> float:
+    """Score a single (PIL Image, prompt) pair with HPSv2.
 
     hpsv2.score() always returns a list (confirmed from the installed package's source —
-    even for a single string image path), so we always take element [0] here rather than
-    branching on the return type.
+    even for a single image), so we always take element [0] here rather than branching on
+    the return type.
 
     Note: v2.0 and v2.1 scores are NOT comparable to each other (different checkpoints,
     different scales) — keep hps_version consistent across everything you intend to compare.
@@ -360,7 +395,7 @@ def compute_hps_score(image_path: str, prompt: str, hps_version: str = DEFAULT_H
                      "(Use --skip-hps to run DSG only without this dependency.)")
         _hpsv2_module = hpsv2
 
-    result = _hpsv2_module.score(image_path, prompt, hps_version=hps_version)
+    result = _hpsv2_module.score(image, prompt, hps_version=hps_version)
     return float(result[0])
 
 # ---------------------------------------------------------------------------
@@ -472,16 +507,12 @@ def call_llm(client: OpenAI, system: str, user: str, model: str) -> str:
 # VQA call via OpenRouter image_url content block
 # ---------------------------------------------------------------------------
 
-def image_to_data_url(image_path: str) -> tuple[str, str]:
-    """Return (data_url, media_type) for a local image."""
-    ext = Path(image_path).suffix.lower()
-    media_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                 ".png": "image/png",  ".gif":  "image/gif",
-                 ".webp": "image/webp"}
-    media_type = media_map.get(ext, "image/jpeg")
-    with open(image_path, "rb") as f:
-        b64 = base64.standard_b64encode(f.read()).decode()
-    return f"data:{media_type};base64,{b64}", media_type
+def image_to_data_url(image) -> tuple[str, str]:
+    """Return (data_url, media_type) for a PIL Image (encoded in-memory as PNG)."""
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    b64 = base64.standard_b64encode(buf.getvalue()).decode()
+    return "data:image/png;base64," + b64, "image/png"
 
 
 def call_vqa(client: OpenAI, question: str, data_url: str, model: str) -> str:
@@ -684,14 +715,13 @@ def dependency_aware_score(tuples: list[dict], dependencies: dict,
 # Top-level evaluate function
 # ---------------------------------------------------------------------------
 
-def evaluate(prompt: str, image_path: str, client: OpenAI,
+def evaluate(prompt: str, image, client: OpenAI,
              llm_model: str, vqa_model: str,
              run_dsg: bool = True, run_hps: bool = True,
              hps_version: str = DEFAULT_HPS_VERSION,
              verbose: bool = True) -> dict:
     print(f"\n{'='*60}")
     print(f"Prompt    : {prompt}")
-    print(f"Image     : {image_path}")
     if run_dsg:
         print(f"LLM model : {llm_model}")
         print(f"VQA model : {vqa_model}")
@@ -699,7 +729,7 @@ def evaluate(prompt: str, image_path: str, client: OpenAI,
         print(f"HPS ver.  : {hps_version}")
     print(f"{'='*60}")
 
-    result = {"prompt": prompt, "image_path": image_path}
+    result = {"prompt": prompt}
 
     if run_dsg:
         print("\n[Step 1] Generating semantic tuples …")
@@ -720,8 +750,8 @@ def evaluate(prompt: str, image_path: str, client: OpenAI,
             for qid, q in questions.items():
                 print(f"  {qid}: {q}")
 
-        print("\n[Step 4] Loading image …")
-        data_url, _ = image_to_data_url(image_path)
+        print("\n[Step 4] Encoding image …")
+        data_url, _ = image_to_data_url(image)
 
         print("\n[Step 5] Running VQA …")
         answers = run_vqa(client, questions, data_url, vqa_model)
@@ -744,7 +774,7 @@ def evaluate(prompt: str, image_path: str, client: OpenAI,
 
     if run_hps:
         print("\n[Step 7] Computing HPSv2 score …")
-        result["hps_score"] = compute_hps_score(image_path, prompt, hps_version)
+        result["hps_score"] = compute_hps_score(image, prompt, hps_version)
         result["hps_version"] = hps_version
         print(f"  ✓ HPSv2 score ({hps_version}) : {result['hps_score']:.4f}")
 
@@ -760,9 +790,9 @@ def main():
     group.add_argument("--prompt", help="Single text prompt")
     group.add_argument("--csv",    help="CSV file with columns: prompt, image_path")
     group.add_argument("--checkpoint-path",
-                       help="Generate completions from this checkpoint over the fixed "
-                            "TEST_PROMPTS set (same prompts as eval_checkpoint.py) and "
-                            "evaluate each. Final image prompt = '<prompt><completion>'.")
+                       help="Generate completions from this checkpoint over the 200 DrawBench "
+                            "prompts (shunk031/DrawBench on HuggingFace) and evaluate each. "
+                            "Final image prompt = '<prompt><completion>'.")
 
     parser.add_argument("--image",     help="Path to image; if omitted (or blank in CSV), "
                                             "an image is generated via Stable Diffusion")
@@ -770,6 +800,10 @@ def main():
                                        help="Stable Diffusion model for image generation")
     parser.add_argument("--device",    default=DEFAULT_DEVICE,
                                        help="Device for Stable Diffusion (cuda / cpu / mps)")
+    parser.add_argument("--image-cache-dir", default="dsg_image_cache",
+                                       help="Directory for caching SD-generated images so they "
+                                            "are not regenerated on retry (default: dsg_image_cache). "
+                                            "Pass '' to disable caching.")
     parser.add_argument("--output",    default="dsg_results.json",   help="Output JSON path")
     parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL,    help="OpenRouter model for LLM steps")
     parser.add_argument("--vqa-model", default=DEFAULT_VQA_MODEL,    help="OpenRouter model for VQA step")
@@ -826,12 +860,33 @@ def main():
 
     client = make_client(args.api_key) if run_dsg else None
 
-    def resolve_image(prompt: str, image_path: str, index: int = 0) -> str:
-        """Return image_path, generating the image first if the file doesn't exist."""
+    # Load existing results up-front so periodic flushes can include them.
+    existing: list = []
+    if Path(args.output).exists():
+        try:
+            with open(args.output) as f:
+                existing = json.load(f)
+            if not isinstance(existing, list):
+                existing = []
+        except (json.JSONDecodeError, OSError):
+            existing = []
+
+    def _flush(current_results: list, n: int) -> None:
+        """Write existing + current_results to the output file and print a progress line."""
+        with open(args.output, "w") as f:
+            json.dump(existing + current_results, f, indent=2)
+        print(f"  [flush] {n} prompt(s) done — partial results written to {args.output}")
+
+    image_cache_dir = Path(args.image_cache_dir) if args.image_cache_dir else None
+
+    def resolve_image(prompt: str, image_path: str):
+        """Return a PIL Image. Loads from disk if image_path exists, otherwise generates via SD.
+        Generated images are cached in image_cache_dir (if set) to avoid re-running SD on retry.
+        """
+        from PIL import Image as PILImage
         if image_path and Path(image_path).exists():
-            return image_path
-        save_path = image_path if image_path else f"dsg_generated_{index}.png"
-        return generate_sd_image(prompt, save_path, args.sd_model, args.device)
+            return PILImage.open(image_path).convert("RGB")
+        return generate_sd_image(prompt, args.sd_model, args.device, cache_dir=image_cache_dir)
 
     def maybe_enrich(prompt: str) -> str:
         """Return enriched prompt if --enrich-method is set, otherwise the original."""
@@ -843,8 +898,8 @@ def main():
 
     if args.prompt:
         gen_prompt = maybe_enrich(args.prompt)
-        image_path = resolve_image(gen_prompt, args.image, index=0)
-        res = evaluate(args.prompt, image_path, client, args.llm_model, args.vqa_model,
+        image = resolve_image(gen_prompt, args.image)
+        res = evaluate(args.prompt, image, client, args.llm_model, args.vqa_model,
                        run_dsg=run_dsg, run_hps=run_hps, hps_version=args.hps_version)
         res["enriched_prompt"] = gen_prompt
         results = [res]
@@ -855,25 +910,28 @@ def main():
             for i, row in enumerate(csv.DictReader(f)):
                 prompt     = row["prompt"].strip()
                 gen_prompt = maybe_enrich(prompt)
-                image_path = resolve_image(gen_prompt, row.get("image_path", "").strip(), index=i)
+                image = resolve_image(gen_prompt, row.get("image_path", "").strip())
                 try:
-                    res = evaluate(prompt, image_path, client, args.llm_model, args.vqa_model,
+                    res = evaluate(prompt, image, client, args.llm_model, args.vqa_model,
                                    run_dsg=run_dsg, run_hps=run_hps, hps_version=args.hps_version)
                     res["enriched_prompt"] = gen_prompt
                 except Exception as e:
                     # One bad LLM/API response shouldn't lose every other already-computed
                     # result in the batch — record the failure and keep going.
                     print(f"  [ERROR] row {i} ({prompt[:50]!r}) failed, skipping: {e}")
-                    res = {"prompt": prompt, "image_path": image_path,
-                          "enriched_prompt": gen_prompt, "error": str(e)}
+                    res = {"prompt": prompt, "enriched_prompt": gen_prompt, "error": str(e)}
                 results.append(res)
+                if len(results) % 20 == 0:
+                    _flush(results, len(results))
     else:
-        # --checkpoint-path: generate completions over the fixed TEST_PROMPTS set, evaluate each.
+        # --checkpoint-path: generate completions over DrawBench (200 prompts), evaluate each.
         step_label = args.step_label or Path(args.checkpoint_path).name
         print(f"[Checkpoint] step_label = {step_label!r}")
 
+        drawbench_prompts = _load_drawbench_prompts()
+        print(f"[Checkpoint] Loaded {len(drawbench_prompts)} DrawBench prompts")
         completions = generate_completions_from_checkpoint(
-            args.checkpoint_path, TEST_PROMPTS,
+            args.checkpoint_path, drawbench_prompts,
             num_samples=args.num_samples,
             max_new_tokens=args.gen_max_new_tokens,
             temperature=args.gen_temperature,
@@ -886,37 +944,27 @@ def main():
             # throughout this project (prompt + completion — completions already carry
             # whatever leading punctuation/spacing they were trained to produce).
             final_prompt = row["prompt"] + row["completion"]
-            # Unique filename per (step_label, index) so images from different checkpoint
-            # runs don't silently overwrite each other on disk (default naming otherwise
-            # collides: dsg_generated_0.png, dsg_generated_1.png, ... every run).
-            image_path = resolve_image(final_prompt, f"dsg_generated_{step_label}_{i}.png", index=i)
+            image = resolve_image(final_prompt, "")
             try:
-                res = evaluate(final_prompt, image_path, client, args.llm_model, args.vqa_model,
+                res = evaluate(final_prompt, image, client, args.llm_model, args.vqa_model,
                                run_dsg=run_dsg, run_hps=run_hps, hps_version=args.hps_version)
             except Exception as e:
-                # Same reasoning as the CSV loop: a batch here can be dozens of items
-                # (len(TEST_PROMPTS) * num_samples) — one bad response must not cost every
+                # Same reasoning as the CSV loop: a batch here can be 400 items
+                # (200 DrawBench prompts * num_samples) — one bad response must not cost every
                 # other already-computed result.
                 print(f"  [ERROR] item {i} ({row['prompt'][:50]!r}) failed, skipping: {e}")
-                res = {"prompt": final_prompt, "image_path": image_path, "error": str(e)}
+                res = {"prompt": final_prompt, "error": str(e)}
             res["checkpoint_path"]   = args.checkpoint_path
             res["step_label"]        = step_label
             res["original_prompt"]   = row["prompt"]
             res["completion"]        = row["completion"]
             results.append(res)
+            if len(results) % 20 == 0:
+                _flush(results, len(results))
 
     # Append rather than overwrite, so evaluating multiple checkpoints over time (via repeated
     # --checkpoint-path runs with different --step-label values) builds one comparable table,
     # the same idea as eval_checkpoint.py's eval_results.csv.
-    existing = []
-    if Path(args.output).exists():
-        try:
-            with open(args.output) as f:
-                existing = json.load(f)
-            if not isinstance(existing, list):
-                existing = []
-        except (json.JSONDecodeError, OSError):
-            existing = []
     all_results = existing + results
 
     with open(args.output, "w") as f:
